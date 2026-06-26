@@ -218,11 +218,15 @@ def container_state(container):
     return "UNKNOWN"
 
 
+def container_is_healthy(container):
+    return container_state(container) == "RUNNING"
+
+
 def docker_health(containers):
-    has_unhealthy_container = any(
-        container_state(container) == "UNHEALTHY" for container in containers
-    )
-    return "UNHEALTHY" if has_unhealthy_container else "HEALTHY"
+    if all(container_is_healthy(container) for container in containers):
+        return "HEALTHY"
+
+    return "UNHEALTHY"
 
 
 def check_docker_status():
@@ -385,38 +389,131 @@ class DockerMonitorApp:
             sticky="w",
         )
 
-        table_frame = ttk.Frame(self.containers_tab)
-        table_frame.pack(fill="both", expand=True)
+        checkerboard_frame = ttk.Frame(self.containers_tab)
+        checkerboard_frame.pack(fill="both", expand=True)
 
-        columns = ("state", "name", "image", "status")
-        self.container_tree = ttk.Treeview(
-            table_frame,
-            columns=columns,
-            show="headings",
-            height=14,
+        self.container_canvas = tk.Canvas(
+            checkerboard_frame,
+            bg="#f3f4f6",
+            highlightthickness=0,
         )
-        self.container_tree.heading("state", text="State")
-        self.container_tree.heading("name", text="Name")
-        self.container_tree.heading("image", text="Image")
-        self.container_tree.heading("status", text="Status")
-        self.container_tree.column("state", width=105, anchor="w", stretch=False)
-        self.container_tree.column("name", width=190, anchor="w")
-        self.container_tree.column("image", width=230, anchor="w")
-        self.container_tree.column("status", width=330, anchor="w")
-        self.container_tree.tag_configure("healthy", foreground="green")
-        self.container_tree.tag_configure("unhealthy", foreground="red")
-
         scrollbar = ttk.Scrollbar(
-            table_frame,
+            checkerboard_frame,
             orient="vertical",
-            command=self.container_tree.yview,
+            command=self.container_canvas.yview,
         )
-        self.container_tree.configure(yscrollcommand=scrollbar.set)
+        self.container_canvas.configure(yscrollcommand=scrollbar.set)
 
-        self.container_tree.grid(row=0, column=0, sticky="nsew")
+        self.container_grid = tk.Frame(self.container_canvas, bg="#f3f4f6")
+        self.container_grid_window = self.container_canvas.create_window(
+            (0, 0),
+            window=self.container_grid,
+            anchor="nw",
+        )
+        self.container_grid.bind("<Configure>", self.update_checkerboard_scroll_region)
+        self.container_canvas.bind("<Configure>", self.resize_checkerboard)
+        self.container_canvas.bind("<MouseWheel>", self.scroll_checkerboard)
+
+        self.container_canvas.grid(row=0, column=0, sticky="nsew")
         scrollbar.grid(row=0, column=1, sticky="ns")
-        table_frame.columnconfigure(0, weight=1)
-        table_frame.rowconfigure(0, weight=1)
+        checkerboard_frame.columnconfigure(0, weight=1)
+        checkerboard_frame.rowconfigure(0, weight=1)
+
+    def update_checkerboard_scroll_region(self, _event=None):
+        self.container_canvas.configure(scrollregion=self.container_canvas.bbox("all"))
+
+    def resize_checkerboard(self, event):
+        self.container_canvas.itemconfigure(self.container_grid_window, width=event.width)
+
+    def scroll_checkerboard(self, event):
+        self.container_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    def add_container_tile(self, row, column, container):
+        state = container_state(container)
+        healthy = container_is_healthy(container)
+        health_label = "HEALTHY" if healthy else "UNHEALTHY"
+        tile_color = "#15803d" if healthy else "#b91c1c"
+        detail_color = "#dcfce7" if healthy else "#fee2e2"
+
+        tile = tk.Frame(
+            self.container_grid,
+            bg=tile_color,
+            bd=1,
+            relief="solid",
+            width=210,
+            height=128,
+        )
+        tile.grid(row=row, column=column, sticky="nsew", padx=5, pady=5)
+        tile.grid_propagate(False)
+
+        tk.Label(
+            tile,
+            text=health_label,
+            bg=tile_color,
+            fg="white",
+            font=("Segoe UI", 11, "bold"),
+            anchor="w",
+        ).pack(fill="x", padx=10, pady=(8, 1))
+
+        tk.Label(
+            tile,
+            text=container.get("Names", "<unknown>"),
+            bg=tile_color,
+            fg="white",
+            font=("Segoe UI", 10, "bold"),
+            anchor="w",
+            justify="left",
+            wraplength=185,
+        ).pack(fill="x", padx=10)
+
+        tk.Label(
+            tile,
+            text=f"State: {state}",
+            bg=tile_color,
+            fg=detail_color,
+            anchor="w",
+        ).pack(fill="x", padx=10, pady=(6, 0))
+
+        tk.Label(
+            tile,
+            text=container.get("Status", ""),
+            bg=tile_color,
+            fg=detail_color,
+            anchor="w",
+            justify="left",
+            wraplength=185,
+        ).pack(fill="x", padx=10)
+
+    def add_empty_container_tile(self):
+        tile = tk.Frame(
+            self.container_grid,
+            bg="#6b7280",
+            bd=1,
+            relief="solid",
+            width=210,
+            height=128,
+        )
+        tile.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
+        tile.grid_propagate(False)
+
+        tk.Label(
+            tile,
+            text="NO CONTAINERS",
+            bg="#6b7280",
+            fg="white",
+            font=("Segoe UI", 11, "bold"),
+            anchor="w",
+        ).pack(fill="x", padx=10, pady=(8, 1))
+
+        tk.Label(
+            tile,
+            text="No Docker containers were returned.",
+            bg="#6b7280",
+            fg="#f3f4f6",
+            anchor="w",
+            justify="left",
+            wraplength=185,
+        ).pack(fill="x", padx=10)
 
     def check_now(self):
         self.cancel_next_check()
@@ -543,23 +640,26 @@ class DockerMonitorApp:
             f"stopped={info.get('ContainersStopped', 'unknown')}"
         )
 
-        for row_id in self.container_tree.get_children():
-            self.container_tree.delete(row_id)
+        for child in self.container_grid.winfo_children():
+            child.destroy()
 
-        for container in containers:
-            state = container_state(container)
-            tag = "unhealthy" if state == "UNHEALTHY" else "healthy"
-            self.container_tree.insert(
-                "",
-                "end",
-                values=(
-                    state,
-                    container.get("Names", "<unknown>"),
-                    container.get("Image", "<unknown>"),
-                    container.get("Status", ""),
-                ),
-                tags=(tag,),
-            )
+        canvas_width = max(self.container_canvas.winfo_width(), 1)
+        columns = max(2, min(5, canvas_width // 220))
+
+        for column in range(5):
+            self.container_grid.columnconfigure(column, weight=0, minsize=0)
+
+        for column in range(columns):
+            self.container_grid.columnconfigure(column, weight=1, minsize=210)
+
+        if not containers:
+            self.add_empty_container_tile()
+            self.notebook.select(self.containers_tab)
+            return
+
+        for index, container in enumerate(containers):
+            row, column = divmod(index, columns)
+            self.add_container_tile(row, column, container)
 
         self.notebook.select(self.containers_tab)
 
