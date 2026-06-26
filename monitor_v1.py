@@ -394,6 +394,11 @@ class DockerMonitorApp:
         self.root = root
         self.check_running = False
         self.next_check_id = None
+        self.container_resize_id = None
+        self.gpu_resize_id = None
+        self.last_containers = None
+        self.last_gpus = None
+        self.last_gpu_available = False
 
         self.selected_host_var = tk.StringVar(value=HOST_CHOICES[0])
         self.username_var = tk.StringVar(value=USERNAME)
@@ -435,7 +440,7 @@ class DockerMonitorApp:
 
     def build_connection_tab(self):
         form = ttk.Frame(self.connection_tab)
-        form.grid(row=0, column=0, sticky="nw")
+        form.grid(row=0, column=0, sticky="ew")
         self.connection_tab.columnconfigure(0, weight=1)
 
         ttk.Label(form, text="Host").grid(row=0, column=0, sticky="w", pady=5)
@@ -444,12 +449,11 @@ class DockerMonitorApp:
             textvariable=self.selected_host_var,
             values=HOST_CHOICES,
             state="readonly",
-            width=34,
         )
         self.host_combo.grid(row=0, column=1, sticky="ew", pady=5)
 
         ttk.Label(form, text="Username").grid(row=1, column=0, sticky="w", pady=5)
-        self.username_entry = ttk.Entry(form, textvariable=self.username_var, width=34)
+        self.username_entry = ttk.Entry(form, textvariable=self.username_var)
         self.username_entry.grid(row=1, column=1, sticky="ew", pady=5)
 
         ttk.Label(form, text="Password").grid(row=2, column=0, sticky="w", pady=5)
@@ -457,7 +461,6 @@ class DockerMonitorApp:
             form,
             textvariable=self.password_var,
             show="*",
-            width=34,
         )
         self.password_entry.grid(row=2, column=1, sticky="ew", pady=5)
         self.password_entry.bind("<Return>", lambda _event: self.check_now())
@@ -592,6 +595,8 @@ class DockerMonitorApp:
 
     def resize_checkerboard(self, event):
         self.container_canvas.itemconfigure(self.container_grid_window, width=event.width)
+        if self.last_containers is not None:
+            self.schedule_container_resize()
 
     def scroll_checkerboard(self, event):
         self.container_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
@@ -601,24 +606,45 @@ class DockerMonitorApp:
 
     def resize_gpu_grid(self, event):
         self.gpu_canvas.itemconfigure(self.gpu_grid_window, width=event.width)
+        if self.last_gpus is not None:
+            self.schedule_gpu_resize()
 
     def scroll_gpu_grid(self, event):
         self.gpu_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
-    def add_container_tile(self, row, column, container):
+    def schedule_container_resize(self):
+        if self.container_resize_id is not None:
+            self.root.after_cancel(self.container_resize_id)
+
+        self.container_resize_id = self.root.after(100, self.render_container_tiles)
+
+    def schedule_gpu_resize(self):
+        if self.gpu_resize_id is not None:
+            self.root.after_cancel(self.gpu_resize_id)
+
+        self.gpu_resize_id = self.root.after(100, self.render_gpu_tiles)
+
+    def grid_layout(self, canvas_width, preferred_width, min_width, max_columns):
+        canvas_width = max(canvas_width, min_width)
+        columns = max(1, min(max_columns, canvas_width // preferred_width))
+        tile_width = max(min_width, (canvas_width - (columns * 12)) // columns)
+        return columns, tile_width
+
+    def add_container_tile(self, row, column, container, tile_width, tile_height):
         state = container_state(container)
         healthy = container_is_healthy(container)
         health_label = "HEALTHY" if healthy else "UNHEALTHY"
         tile_color = "#15803d" if healthy else "#b91c1c"
         detail_color = "#dcfce7" if healthy else "#fee2e2"
+        wraplength = max(140, tile_width - 20)
 
         tile = tk.Frame(
             self.container_grid,
             bg=tile_color,
             bd=1,
             relief="solid",
-            width=210,
-            height=128,
+            width=tile_width,
+            height=tile_height,
         )
         tile.grid(row=row, column=column, sticky="nsew", padx=5, pady=5)
         tile.grid_propagate(False)
@@ -640,7 +666,7 @@ class DockerMonitorApp:
             font=("Segoe UI", 10, "bold"),
             anchor="w",
             justify="left",
-            wraplength=185,
+            wraplength=wraplength,
         ).pack(fill="x", padx=10)
 
         tk.Label(
@@ -658,17 +684,18 @@ class DockerMonitorApp:
             fg=detail_color,
             anchor="w",
             justify="left",
-            wraplength=185,
+            wraplength=wraplength,
         ).pack(fill="x", padx=10)
 
-    def add_empty_container_tile(self):
+    def add_empty_container_tile(self, tile_width, tile_height):
+        wraplength = max(140, tile_width - 20)
         tile = tk.Frame(
             self.container_grid,
             bg="#6b7280",
             bd=1,
             relief="solid",
-            width=210,
-            height=128,
+            width=tile_width,
+            height=tile_height,
         )
         tile.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
         tile.grid_propagate(False)
@@ -689,10 +716,10 @@ class DockerMonitorApp:
             fg="#f3f4f6",
             anchor="w",
             justify="left",
-            wraplength=185,
+            wraplength=wraplength,
         ).pack(fill="x", padx=10)
 
-    def add_metric_bar(self, parent, label, value_text, ratio, bar_color):
+    def add_metric_bar(self, parent, label, value_text, ratio, bar_color, bar_width):
         row = tk.Frame(parent, bg=parent["bg"])
         row.pack(fill="x", padx=10, pady=(5, 0))
 
@@ -702,24 +729,23 @@ class DockerMonitorApp:
             bg=parent["bg"],
             fg="#f9fafb",
             anchor="w",
-            width=11,
         ).pack(side="left")
-
-        bar = tk.Canvas(row, width=115, height=9, bg="#111827", highlightthickness=0)
-        bar.pack(side="left", padx=(4, 6))
-
-        if ratio is not None:
-            bar.create_rectangle(0, 0, int(115 * ratio), 9, fill=bar_color, width=0)
 
         tk.Label(
             row,
             text=value_text,
             bg=parent["bg"],
             fg="#f9fafb",
-            anchor="w",
-        ).pack(side="left")
+            anchor="e",
+        ).pack(side="right")
 
-    def add_gpu_tile(self, row, column, gpu):
+        bar = tk.Canvas(parent, width=bar_width, height=9, bg="#111827", highlightthickness=0)
+        bar.pack(fill="x", padx=10, pady=(1, 0))
+
+        if ratio is not None:
+            bar.create_rectangle(0, 0, int(bar_width * ratio), 9, fill=bar_color, width=0)
+
+    def add_gpu_tile(self, row, column, gpu, tile_width, tile_height):
         healthy = gpu_is_healthy(gpu)
         status_label = "OK" if healthy else "HOT"
         tile_color = "#155e75" if healthy else "#b91c1c"
@@ -727,14 +753,16 @@ class DockerMonitorApp:
         memory_ratio = metric_ratio(gpu.get("memory_used"), gpu.get("memory_total"))
         power_ratio = metric_ratio(gpu.get("power_draw"), gpu.get("power_limit"))
         utilization_ratio = metric_ratio(gpu.get("utilization"), 100)
+        wraplength = max(180, tile_width - 20)
+        bar_width = max(80, tile_width - 20)
 
         tile = tk.Frame(
             self.gpu_grid,
             bg=tile_color,
             bd=1,
             relief="solid",
-            width=290,
-            height=198,
+            width=tile_width,
+            height=tile_height,
         )
         tile.grid(row=row, column=column, sticky="nsew", padx=5, pady=5)
         tile.grid_propagate(False)
@@ -756,7 +784,7 @@ class DockerMonitorApp:
             font=("Segoe UI", 10, "bold"),
             anchor="w",
             justify="left",
-            wraplength=260,
+            wraplength=wraplength,
         ).pack(fill="x", padx=10)
 
         tk.Label(
@@ -773,6 +801,7 @@ class DockerMonitorApp:
             format_metric(gpu.get("utilization"), "%"),
             utilization_ratio,
             bar_color,
+            bar_width,
         )
         self.add_metric_bar(
             tile,
@@ -781,6 +810,7 @@ class DockerMonitorApp:
             f"{format_metric(gpu.get('memory_total'), 'MiB')}",
             memory_ratio,
             bar_color,
+            bar_width,
         )
         self.add_metric_bar(
             tile,
@@ -789,16 +819,18 @@ class DockerMonitorApp:
             f"{format_metric(gpu.get('power_limit'), 'W')}",
             power_ratio,
             bar_color,
+            bar_width,
         )
 
-    def add_gpu_unavailable_tile(self):
+    def add_gpu_unavailable_tile(self, tile_width, tile_height):
+        wraplength = max(180, tile_width - 20)
         tile = tk.Frame(
             self.gpu_grid,
             bg="#6b7280",
             bd=1,
             relief="solid",
-            width=290,
-            height=150,
+            width=tile_width,
+            height=tile_height,
         )
         tile.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
         tile.grid_propagate(False)
@@ -819,7 +851,7 @@ class DockerMonitorApp:
             fg="#f3f4f6",
             anchor="w",
             justify="left",
-            wraplength=260,
+            wraplength=wraplength,
         ).pack(fill="x", padx=10)
 
     def check_now(self):
@@ -965,26 +997,38 @@ class DockerMonitorApp:
             f"paused={info.get('ContainersPaused', 'unknown')}, "
             f"stopped={info.get('ContainersStopped', 'unknown')}"
         )
+        self.last_containers = containers
+        self.render_container_tiles()
+
+    def render_container_tiles(self):
+        self.container_resize_id = None
 
         for child in self.container_grid.winfo_children():
             child.destroy()
 
         canvas_width = max(self.container_canvas.winfo_width(), 1)
-        columns = max(2, min(5, canvas_width // 220))
+        columns, tile_width = self.grid_layout(
+            canvas_width,
+            preferred_width=220,
+            min_width=180,
+            max_columns=5,
+        )
+        tile_height = max(128, min(170, int(tile_width * 0.58)))
 
         for column in range(5):
             self.container_grid.columnconfigure(column, weight=0, minsize=0)
 
         for column in range(columns):
-            self.container_grid.columnconfigure(column, weight=1, minsize=210)
+            self.container_grid.columnconfigure(column, weight=1, minsize=tile_width)
 
+        containers = self.last_containers or []
         if not containers:
-            self.add_empty_container_tile()
+            self.add_empty_container_tile(tile_width, tile_height)
             return
 
         for index, container in enumerate(containers):
             row, column = divmod(index, columns)
-            self.add_container_tile(row, column, container)
+            self.add_container_tile(row, column, container, tile_width, tile_height)
 
     def update_gpu_status(self, gpus, gpu_available):
         if not gpu_available:
@@ -994,26 +1038,40 @@ class DockerMonitorApp:
             hot_count = sum(1 for gpu in gpus if not gpu_is_healthy(gpu))
             self.set_gpu_status("HOT" if hot_count else "OK")
             self.gpu_count_var.set(f"GPUs: {len(gpus)}")
+        self.last_gpus = gpus
+        self.last_gpu_available = gpu_available
+
+        self.render_gpu_tiles()
+
+    def render_gpu_tiles(self):
+        self.gpu_resize_id = None
 
         for child in self.gpu_grid.winfo_children():
             child.destroy()
 
         canvas_width = max(self.gpu_canvas.winfo_width(), 1)
-        columns = max(1, min(3, canvas_width // 300))
+        columns, tile_width = self.grid_layout(
+            canvas_width,
+            preferred_width=310,
+            min_width=260,
+            max_columns=3,
+        )
+        tile_height = max(230, min(270, int(tile_width * 0.75)))
 
         for column in range(3):
             self.gpu_grid.columnconfigure(column, weight=0, minsize=0)
 
         for column in range(columns):
-            self.gpu_grid.columnconfigure(column, weight=1, minsize=290)
+            self.gpu_grid.columnconfigure(column, weight=1, minsize=tile_width)
 
-        if not gpu_available:
-            self.add_gpu_unavailable_tile()
+        if not self.last_gpu_available:
+            self.add_gpu_unavailable_tile(tile_width, min(tile_height, 170))
             return
 
+        gpus = self.last_gpus or []
         for index, gpu in enumerate(gpus):
             row, column = divmod(index, columns)
-            self.add_gpu_tile(row, column, gpu)
+            self.add_gpu_tile(row, column, gpu, tile_width, tile_height)
 
     def set_connection_status(self, message, color):
         self.connection_status_var.set(message)
