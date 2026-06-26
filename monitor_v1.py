@@ -6,7 +6,7 @@ import paramiko
 HOST = "10.194.78.12"
 PORT = 22
 USERNAME = "pgat.dnew"
-PASSWORD = "A$$C!ownABC001abc" # Recommended: leave as None so PyCharm prompts you securely.
+PASSWORD = None # Recommended: leave as None so PyCharm prompts you securely.
 
 WATCH = True
 INTERVAL_SECONDS = 30
