@@ -5,7 +5,14 @@ import os
 import sys
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 import paramiko
+
+try:
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+except ImportError:
+    ZoneInfo = None
+    ZoneInfoNotFoundError = Exception
 
 try:
     import tkinter as tk
@@ -33,6 +40,67 @@ INTERVAL_SECONDS = 30
 GREEN = "\033[92m"
 RED = "\033[91m"
 RESET = "\033[0m"
+CLOCK_TIMEZONES = (
+    "0  Zulu      - Greenwich, England",
+    "1  Alpha     - Paris, France",
+    "2  Bravo     - Athens, Greece",
+    "3  Charlie   - Moscow, Russia",
+    "4  Delta     - Kabul, Afghanistan",
+    "5  Echo      - New Delhi, India",
+    "6  Foxtrot   - Dhanka, Bangladesh",
+    "7  Golf      - Bangkok, Thailand",
+    "8  Hotel     - Beijing, China",
+    "9  India     - Tokyo, Japan",
+    "10 Kilo      - Sydney, Australia",
+    "11 Lima      - Honiara, Solomon Islands",
+    "12 Mike      - Wellington, New Zealand",
+    "-1 November  - Azores, Portugal"
+    "-2 Oscar     - Godthab, Greenland",
+    "-3 Papa      - Buenos Aires, Argentina",
+    "-4 Quebec    - Halifax, Nova Scotia",
+    "-5 Romeo     - Washington, USA",
+    "-6 Sierra    - Dallas, TX (United States)",
+    "-7 Tango     - Denver, CO (United States)",
+    "-8 Uniform   - Seattle, WA (United States)",
+    "-9 Victor    - Juneau, AK (United States)",
+    "-10 Whiskey  - Honolulu, HI (United States)",
+    "-11 X-Ray    - Nome, AK (United States)",
+    "-12 Yankee   - Suva, Fiji",
+)
+DEFAULT_CLOCK_TIMEZONES = (
+    "0  Zulu      - Greenwich, England",
+    "-5 Romeo     - Washington, USA",
+    "-10 Whiskey  - Honolulu, HI (United States)",
+    "10 Kilo      - Sydney, Australia",
+
+)
+CLOCK_FALLBACK_OFFSETS = {
+    "0  Zulu      - Greenwich, England": 0,
+    "1  Alpha     - Paris, France": 1,
+    "2  Bravo     - Athens, Greece": 2,
+    "3  Charlie   - Moscow, Russia": 3,
+    "4  Delta     - Kabul, Afghanistan": 4,
+    "5  Echo      - New Delhi, India": 5,
+    "6  Foxtrot   - Dhanka, Bangladesh": 6,
+    "7  Golf      - Bangkok, Thailand": 7,
+    "8  Hotel     - Beijing, China": 8,
+    "9  India     - Tokyo, Japan": 9,
+    "10 Kilo      - Sydney, Australia": 10,
+    "11 Lima      - Honiara, Solomon Islands": 11,
+    "12 Mike      - Wellington, New Zealand":12 ,
+    "-1 November  - Azores, Portugal": -1,
+    "-2 Oscar     - Godthab, Greenland": -2,
+    "-3 Papa      - Buenos Aires, Argentina": -3,
+    "-4 Quebec    - Halifax, Nova Scotia": -4,
+    "-5 Romeo     - Washington, USA": -5,
+    "-6 Sierra    - Dallas, TX (United States)": -6,
+    "-7 Tango     - Denver, CO (United States)": -7,
+    "-8 Uniform   - Seattle, WA (United States)": -8,
+    "-9 Victor    - Juneau, AK (United States)": -9,
+    "-10 Whiskey  - Honolulu, HI (United States)": -10,
+    "-11 X-Ray    - Nome, AK (United States)": -11,
+    "-12 Yankee   - Suva, Fiji": -12,
+}
 
 REMOTE_CMD = (
     "docker_exit=0; "
@@ -414,12 +482,19 @@ class DockerMonitorApp:
         self.gpu_status_var = tk.StringVar(value="GPU status: UNKNOWN")
         self.gpu_count_var = tk.StringVar(value="GPUs: unknown")
         self.refresh_var = tk.StringVar(value=f"Auto refresh: {INTERVAL_SECONDS}s")
+        self.clock_timezone_vars = [
+            tk.StringVar(value=timezone_name)
+            for timezone_name in DEFAULT_CLOCK_TIMEZONES
+        ]
+        self.clock_date_vars = [tk.StringVar(value="-- --- ----") for _index in range(4)]
+        self.clock_time_vars = [tk.StringVar(value="----") for _index in range(4)]
 
         self.root.title("PE Monitor")
         self.root.geometry("1058x741")
         self.root.minsize(874, 582)
 
         self.build_ui()
+        self.update_clocks()
         self.password_entry.focus_set()
 
     def build_ui(self):
@@ -438,9 +513,74 @@ class DockerMonitorApp:
         self.build_containers_tab()
         self.build_gpus_tab()
 
+    def build_clock_bar(self, parent, layout="pack"):
+        clock_bar = ttk.Frame(parent)
+
+        if layout == "grid":
+            clock_bar.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+            parent.columnconfigure(0, weight=1)
+        else:
+            clock_bar.pack(fill="x", pady=(0, 12))
+
+        for index in range(4):
+            clock_bar.columnconfigure(index, weight=1)
+
+            clock_frame = ttk.Frame(clock_bar)
+            clock_frame.grid(row=0, column=index, sticky="ew", padx=4)
+
+            ttk.Combobox(
+                clock_frame,
+                textvariable=self.clock_timezone_vars[index],
+                values=CLOCK_TIMEZONES,
+                state="readonly",
+            ).pack(fill="x")
+
+            tk.Label(
+                clock_frame,
+                textvariable=self.clock_date_vars[index],
+                anchor="center",
+                font=("Segoe UI", 12, "bold"),
+                fg="black",
+            ).pack(fill="x", pady=(4, 0))
+
+            tk.Label(
+                clock_frame,
+                textvariable=self.clock_time_vars[index],
+                anchor="center",
+                font=("Segoe UI", 18, "bold"),
+                fg="#ff8c00",
+            ).pack(fill="x")
+
+        return clock_bar
+
+    def update_clocks(self):
+        for index, timezone_var in enumerate(self.clock_timezone_vars):
+            clock_date, clock_time = self.clock_parts(timezone_var.get())
+            self.clock_date_vars[index].set(clock_date)
+            self.clock_time_vars[index].set(clock_time)
+
+        self.root.after(1000, self.update_clocks)
+
+    def clock_parts(self, timezone_name):
+        if timezone_name == "UTC" or ZoneInfo is None:
+            now = datetime.now(self.clock_timezone_fallback(timezone_name))
+        else:
+            try:
+                now = datetime.now(ZoneInfo(timezone_name))
+            except ZoneInfoNotFoundError:
+                now = datetime.now(self.clock_timezone_fallback(timezone_name))
+
+        return now.strftime("%d %b %Y").upper(), now.strftime("%H%M")
+
+    def clock_timezone_fallback(self, timezone_name):
+        offset = CLOCK_FALLBACK_OFFSETS.get(timezone_name, 0)
+        return timezone(timedelta(hours=offset))
+
     def build_connection_tab(self):
+        self.build_clock_bar(self.connection_tab, layout="grid")
+
         form = ttk.Frame(self.connection_tab)
-        form.grid(row=0, column=0, sticky="ew")
+        form.grid(row=1, column=0, sticky="ew")
         self.connection_tab.columnconfigure(0, weight=1)
 
         ttk.Label(form, text="Host").grid(row=0, column=0, sticky="w", pady=5)
@@ -468,7 +608,7 @@ class DockerMonitorApp:
         form.columnconfigure(1, weight=1)
 
         buttons = ttk.Frame(self.connection_tab)
-        buttons.grid(row=1, column=0, sticky="w", pady=(18, 8))
+        buttons.grid(row=2, column=0, sticky="w", pady=(18, 8))
 
         self.check_button = ttk.Button(buttons, text="Check Now", command=self.check_now)
         self.check_button.grid(row=0, column=0, padx=(0, 8))
@@ -479,7 +619,7 @@ class DockerMonitorApp:
         )
 
         ttk.Label(self.connection_tab, textvariable=self.refresh_var).grid(
-            row=2,
+            row=3,
             column=0,
             sticky="w",
             pady=(4, 12),
@@ -491,9 +631,11 @@ class DockerMonitorApp:
             anchor="w",
             fg="black",
         )
-        self.connection_status_label.grid(row=3, column=0, sticky="ew")
+        self.connection_status_label.grid(row=4, column=0, sticky="ew")
 
     def build_containers_tab(self):
+        self.build_clock_bar(self.containers_tab)
+
         summary = ttk.Frame(self.containers_tab)
         summary.pack(fill="x", pady=(0, 12))
 
@@ -546,6 +688,8 @@ class DockerMonitorApp:
         checkerboard_frame.rowconfigure(0, weight=1)
 
     def build_gpus_tab(self):
+        self.build_clock_bar(self.gpus_tab)
+
         summary = ttk.Frame(self.gpus_tab)
         summary.pack(fill="x", pady=(0, 12))
 
