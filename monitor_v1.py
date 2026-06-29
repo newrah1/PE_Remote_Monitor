@@ -25,10 +25,11 @@ except ImportError:
 
 try:
     import tkinter as tk
-    from tkinter import ttk
+    from tkinter import ttk, font as tkfont
 except ImportError:
     tk = None
     ttk = None
+    tkfont = None
 
 HOST_OPTIONS = (
     ("10.194.78.11", "prometheus.ds.maxar.com"),
@@ -60,8 +61,10 @@ DB_PSQL_CONTAINER_ENV = "PE_MONITOR_PSQL_CONTAINER"
 DB_DEFAULT_PSQL_CONTAINER = "deepcore-postgres-1"
 DB_JOBS_QUERY = """
 select
+  state,
   jobrequest::jsonb ->> 'model' as model,
-  jobrequest::jsonb #>> '{image,url}' as image
+  jobrequest::jsonb #>> '{image,url}' as image,
+  timeelapsed as timeselapsed
 from jobs
 where state in ('Running', 'Queued')
   and jobrequest like '{%'
@@ -404,6 +407,61 @@ def parse_db_jobs_output(output):
         raise RuntimeError("Database query did not return a JSON row list.")
 
     return rows
+
+
+def path_basename(value):
+    value = str(value or "").rstrip("/")
+    if not value:
+        return ""
+
+    return value.rsplit("/", 1)[-1]
+
+
+def seconds_to_hhmmss(seconds):
+    seconds = max(0, int(round(float(seconds))))
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    seconds = seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def format_elapsed(value):
+    if value in (None, ""):
+        return ""
+
+    if isinstance(value, (int, float)):
+        return seconds_to_hhmmss(float(value) / 1000)
+
+    text = str(value).strip()
+    if not text:
+        return ""
+
+    try:
+        return seconds_to_hhmmss(float(text) / 1000)
+    except ValueError:
+        pass
+
+    days = 0
+    tokens = text.replace(",", " ").split()
+    for index, token in enumerate(tokens[:-1]):
+        if tokens[index + 1].lower().startswith("day"):
+            try:
+                days = int(float(token))
+            except ValueError:
+                days = 0
+            break
+
+    time_token = next((token for token in tokens if ":" in token), text)
+    time_parts = time_token.split(".", 1)[0].split(":")
+    if len(time_parts) == 3:
+        try:
+            hours, minutes, seconds = [int(float(part)) for part in time_parts]
+        except ValueError:
+            return text
+
+        return seconds_to_hhmmss((days * 24 * 3600) + (hours * 3600) + (minutes * 60) + seconds)
+
+    return text
 
 
 def remote_command_failure_message(result):
@@ -1100,13 +1158,18 @@ class DockerMonitorApp:
 
         self.db_jobs_tree = ttk.Treeview(
             table_frame,
-            columns=("model", "image"),
+            columns=("state", "timeselapsed", "model", "image"),
             show="headings",
         )
+        self.db_jobs_tree.heading("state", text="State")
+        self.db_jobs_tree.heading("timeselapsed", text="Time Elapsed")
         self.db_jobs_tree.heading("model", text="Model")
         self.db_jobs_tree.heading("image", text="Image")
+        self.db_jobs_tree.column("state", width=110, minwidth=90, stretch=False)
+        self.db_jobs_tree.column("timeselapsed", width=120, minwidth=100, stretch=False)
         self.db_jobs_tree.column("model", width=360, minwidth=180, stretch=True)
-        self.db_jobs_tree.column("image", width=760, minwidth=260, stretch=True)
+        self.db_jobs_tree.column("image", width=520, minwidth=220, stretch=True)
+        self.db_jobs_tree.tag_configure("running", background="#15803d", foreground="white")
 
         yscrollbar = ttk.Scrollbar(
             table_frame,
@@ -1487,15 +1550,37 @@ class DockerMonitorApp:
         for item in self.db_jobs_tree.get_children():
             self.db_jobs_tree.delete(item)
 
+        model_values = []
         for row in rows:
+            state = row.get("state", "")
+            model = path_basename(row.get("model", ""))
+            image = path_basename(row.get("image", ""))
+            model_values.append(model)
+
             self.db_jobs_tree.insert(
                 "",
                 "end",
                 values=(
-                    row.get("model", ""),
-                    row.get("image", ""),
+                    state,
+                    format_elapsed(row.get("timeselapsed", "")),
+                    model,
+                    image,
                 ),
+                tags=("running",) if str(state).lower() == "running" else (),
             )
+
+        self.resize_db_model_column(model_values)
+
+    def resize_db_model_column(self, model_values):
+        values = ["Model", *model_values]
+        if tkfont is not None:
+            font = tkfont.nametofont("TkDefaultFont")
+            width = max(font.measure(value) for value in values) + 32
+        else:
+            width = max(len(value) for value in values) * 8 + 32
+
+        width = max(180, width)
+        self.db_jobs_tree.column("model", width=width, minwidth=width)
 
     def set_db_status(self, message, color):
         self.db_status_var.set(message)
