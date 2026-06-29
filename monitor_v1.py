@@ -1,7 +1,9 @@
 import csv
 import json
 import getpass
+import logging
 import os
+import shlex
 import smtplib
 import ssl
 import sys
@@ -12,6 +14,8 @@ from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from email.utils import formataddr, parseaddr
 import paramiko
+
+logging.getLogger("paramiko.transport").setLevel(logging.CRITICAL)
 
 try:
     from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -45,6 +49,46 @@ DASHBOARD_LINKS = (
 )
 DASHBOARD_BUTTON_BG = "#2e7d32"
 DASHBOARD_BUTTON_ACTIVE_BG = "#1b5e20"
+DB_SSH_HOST = "10.194.78.12"
+DB_SSH_PORT = 22
+DB_SSH_USERNAME = "pgat.dnew"
+DB_NAME = "dcs"
+DB_USERNAME = "reveal"
+DB_SSH_PASSWORD_ENV = "PE_MONITOR_DB_SSH_PASSWORD"
+DB_PSQL_COMMAND_ENV = "PE_MONITOR_PSQL_COMMAND"
+DB_PSQL_CONTAINER_ENV = "PE_MONITOR_PSQL_CONTAINER"
+DB_DEFAULT_PSQL_CONTAINER = "deepcore-postgres-1"
+DB_JOBS_QUERY = """
+select
+  jobrequest::jsonb ->> 'model' as model,
+  jobrequest::jsonb #>> '{image,url}' as image
+from jobs
+where state in ('Running', 'Queued')
+  and jobrequest like '{%'
+order by
+  case
+    when state = 'Running' then 1
+    when state = 'Queued' then 2
+  end
+"""
+
+"""
+Added the Alerts tab in monitor_v1.py. It asks for first name, last name, and email, includes a Send Test Email button,
+and sends an alert when a container is first observed down or transitions from healthy to down/missing. It will not keep
+sending every refresh while the same container remains down.
+Email sending uses SMTP via environment variables in monitor_v1.py. Set these before launching the app:
+$env:PE_MONITOR_SMTP_HOST="smtp.yourdomain.com"
+$env:PE_MONITOR_SMTP_PORT="587"
+$env:PE_MONITOR_SMTP_USERNAME="your-user"
+$env:PE_MONITOR_SMTP_PASSWORD="your-password"
+$env:PE_MONITOR_SMTP_FROM="pe-monitor@yourdomain.com"
+Optional: set PE_MONITOR_SMTP_USE_TLS=false for a non-TLS relay on port 25, or PE_MONITOR_SMTP_USE_SSL=true for SSL on
+port 465.
+Verification: syntax check passed, diff whitespace check passed, and a stubbed import check passed. A normal import in
+this shell still fails because paramiko is not installed in the current Python interpreter; that was an existing
+dependency for the app.
+"""
+
 SMTP_HOST_ENV = "PE_MONITOR_SMTP_HOST"
 SMTP_PORT_ENV = "PE_MONITOR_SMTP_PORT"
 SMTP_USERNAME_ENV = "PE_MONITOR_SMTP_USERNAME"
@@ -305,12 +349,83 @@ def send_email(to_address, subject, body, recipient_name=None):
         server.send_message(message)
 
 
-def run_remote_command(command, username=None, password=None, host=None):
+def db_psql_command_prefix():
+    override = os.getenv(DB_PSQL_COMMAND_ENV)
+    if override:
+        return override
+
+    container = os.getenv(DB_PSQL_CONTAINER_ENV) or DB_DEFAULT_PSQL_CONTAINER
+    if container:
+        return (
+            f"docker exec -i {shlex.quote(container)} "
+            "bash -lc 'exec psql \"$@\"' pe-monitor-psql"
+        )
+
+    return (
+        "run_pe_monitor_psql() { "
+        "PSQL=$(command -v psql 2>/dev/null || true); "
+        "if [ -n \"$PSQL\" ]; then \"$PSQL\" \"$@\"; return $?; fi; "
+        "if command -v docker >/dev/null 2>&1; then "
+        "for candidate in /usr/bin/psql /usr/local/bin/psql /bin/psql /usr/pgsql-*/bin/psql; do "
+        "if [ -x \"$candidate\" ]; then \"$candidate\" \"$@\"; return $?; fi; "
+        "done; "
+        "for container in $(docker ps --format '{{.Names}}'); do "
+        "if docker exec \"$container\" bash -lc 'command -v psql >/dev/null 2>&1'; then "
+        "docker exec -i \"$container\" bash -lc 'exec psql \"$@\"' pe-monitor-psql \"$@\"; return $?; "
+        "fi; "
+        "done; "
+        "fi; "
+        f"echo \"psql not found. Install the PostgreSQL client, set {DB_PSQL_COMMAND_ENV}, or set {DB_PSQL_CONTAINER_ENV}.\" >&2; "
+        "exit 127; "
+        "}; "
+        "run_pe_monitor_psql"
+    )
+
+
+def db_jobs_command():
+    wrapped_query = (
+        "select coalesce(json_agg(row_to_json(job_rows)), '[]'::json) "
+        f"from ({DB_JOBS_QUERY}) job_rows"
+    )
+    return (
+        f"{db_psql_command_prefix()} -U {shlex.quote(DB_USERNAME)} "
+        f"-d {shlex.quote(DB_NAME)} -X -q -t -A "
+        f"--set ON_ERROR_STOP=1 -c {shlex.quote(wrapped_query)}"
+    )
+
+
+def parse_db_jobs_output(output):
+    output = output.strip()
+    if not output:
+        return []
+
+    rows = json.loads(output)
+    if not isinstance(rows, list):
+        raise RuntimeError("Database query did not return a JSON row list.")
+
+    return rows
+
+
+def remote_command_failure_message(result):
+    message = result.get("exception") or f"Remote command exited with {result['exit_code']}."
+    command = result.get("command", "").strip()
+    error = result.get("error", "").strip()
+    if command:
+        message = f"{message} Remote command: {command}"
+
+    if error:
+        return f"{message} Remote stderr: {error}"
+
+    return message
+
+
+def run_remote_command(command, username=None, password=None, host=None, port=None):
     host = host or HOST
+    port = port or PORT
     username = username or USERNAME
     password = password or get_ssh_password(username, host)
 
-    print(f"Connecting to {username}@{host}:{PORT}...")
+    print(f"Connecting to {username}@{host}:{port}...")
 
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -318,7 +433,7 @@ def run_remote_command(command, username=None, password=None, host=None):
     try:
         client.connect(
             hostname=host,
-            port=PORT,
+            port=port,
             username=username,
             password=password,
             timeout=15,
@@ -328,7 +443,7 @@ def run_remote_command(command, username=None, password=None, host=None):
             allow_agent=False,
         )
 
-        print("Connected. Running Docker status command...")
+        print("Connected. Running remote command...")
 
         stdin, stdout, stderr = client.exec_command(command, timeout=35)
 
@@ -337,6 +452,9 @@ def run_remote_command(command, username=None, password=None, host=None):
         exit_code = stdout.channel.recv_exit_status()
 
         print(f"Remote command finished with exit code {exit_code}")
+        if exit_code != 0:
+            print("Remote command that failed:")
+            print(command)
 
         return exit_code, output, error
 
@@ -347,9 +465,19 @@ def run_remote_command(command, username=None, password=None, host=None):
             "server allows password login for this account."
         ) from exc
     except paramiko.SSHException as exc:
+        message = str(exc)
+        if "Error reading SSH protocol banner" in message:
+            raise RuntimeError(
+                f"SSH server at {host}:{port} closed the connection before sending "
+                "an SSH banner. Confirm this host and port accept SSH from your "
+                f"machine by running: ssh -vvv -p {port} {username}@{host}"
+            ) from exc
+
         raise RuntimeError(f"SSH connection failed: {exc}") from exc
+    except OSError as exc:
+        raise RuntimeError(f"SSH socket error while connecting to {host}:{port}: {exc}") from exc
     except TimeoutError as exc:
-        raise RuntimeError(f"SSH connection timed out while connecting to {host}:{PORT}.") from exc
+        raise RuntimeError(f"SSH connection timed out while connecting to {host}:{port}.") from exc
     finally:
         client.close()
         print("SSH connection closed.")
@@ -550,6 +678,7 @@ class DockerMonitorApp:
     def __init__(self, root):
         self.root = root
         self.check_running = False
+        self.db_query_running = False
         self.next_check_id = None
         self.container_resize_id = None
         self.gpu_resize_id = None
@@ -576,6 +705,10 @@ class DockerMonitorApp:
         self.alert_last_name_var = tk.StringVar()
         self.alert_email_var = tk.StringVar()
         self.alert_status_var = tk.StringVar(value="Enter alert contact details.")
+        self.db_password_var = tk.StringVar()
+        self.db_status_var = tk.StringVar(
+            value="Enter the reveal SSH password, then click Refresh."
+        )
         self.clock_timezone_vars = [
             tk.StringVar(value=timezone_name)
             for timezone_name in DEFAULT_CLOCK_TIMEZONES
@@ -599,16 +732,19 @@ class DockerMonitorApp:
         self.containers_tab = ttk.Frame(self.notebook, padding=18)
         self.gpus_tab = ttk.Frame(self.notebook, padding=18)
         self.alerts_tab = ttk.Frame(self.notebook, padding=18)
+        self.db_tab = ttk.Frame(self.notebook, padding=18)
 
         self.notebook.add(self.connection_tab, text="Connection")
         self.notebook.add(self.containers_tab, text="Containers")
         self.notebook.add(self.gpus_tab, text="GPUs")
         self.notebook.add(self.alerts_tab, text="Alerts")
+        self.notebook.add(self.db_tab, text="DCS Jobs")
 
         self.build_connection_tab()
         self.build_containers_tab()
         self.build_gpus_tab()
         self.build_alerts_tab()
+        self.build_db_tab()
 
     def build_clock_bar(self, parent, layout="pack"):
         clock_bar = ttk.Frame(parent)
@@ -907,6 +1043,92 @@ class DockerMonitorApp:
         )
         self.alert_status_label.grid(row=3, column=0, sticky="ew")
 
+    def build_db_tab(self):
+        self.build_clock_bar(self.db_tab, layout="grid")
+
+        form = ttk.Frame(self.db_tab)
+        form.grid(row=1, column=0, sticky="ew")
+        self.db_tab.columnconfigure(0, weight=1)
+        self.db_tab.rowconfigure(3, weight=1)
+
+        ttk.Label(form, text="SSH").grid(row=0, column=0, sticky="w", pady=5)
+        ttk.Label(
+            form,
+            text=f"{DB_SSH_USERNAME}@{DB_SSH_HOST}:{DB_SSH_PORT}",
+        ).grid(row=0, column=1, sticky="w", pady=5)
+
+        ttk.Label(form, text="Database").grid(row=1, column=0, sticky="w", pady=5)
+        ttk.Label(form, text=DB_NAME).grid(row=1, column=1, sticky="w", pady=5)
+
+        ttk.Label(form, text="SSH Password").grid(row=2, column=0, sticky="w", pady=5)
+        self.db_password_entry = ttk.Entry(
+            form,
+            textvariable=self.db_password_var,
+            show="*",
+        )
+        self.db_password_entry.grid(row=2, column=1, sticky="ew", pady=5)
+        self.db_password_entry.bind("<Return>", lambda _event: self.refresh_db_jobs())
+
+        buttons = ttk.Frame(form)
+        buttons.grid(row=3, column=1, sticky="w", pady=(12, 4))
+
+        self.db_refresh_button = ttk.Button(
+            buttons,
+            text="Refresh",
+            command=self.refresh_db_jobs,
+        )
+        self.db_refresh_button.grid(row=0, column=0, padx=(0, 8))
+
+        ttk.Button(
+            buttons,
+            text="Clear Password",
+            command=self.clear_db_password,
+        ).grid(row=0, column=1, padx=(0, 8))
+
+        form.columnconfigure(1, weight=1)
+
+        self.db_status_label = tk.Label(
+            self.db_tab,
+            textvariable=self.db_status_var,
+            anchor="w",
+            fg="black",
+        )
+        self.db_status_label.grid(row=2, column=0, sticky="ew", pady=(10, 8))
+
+        table_frame = ttk.Frame(self.db_tab)
+        table_frame.grid(row=3, column=0, sticky="nsew")
+
+        self.db_jobs_tree = ttk.Treeview(
+            table_frame,
+            columns=("model", "image"),
+            show="headings",
+        )
+        self.db_jobs_tree.heading("model", text="Model")
+        self.db_jobs_tree.heading("image", text="Image")
+        self.db_jobs_tree.column("model", width=360, minwidth=180, stretch=True)
+        self.db_jobs_tree.column("image", width=760, minwidth=260, stretch=True)
+
+        yscrollbar = ttk.Scrollbar(
+            table_frame,
+            orient="vertical",
+            command=self.db_jobs_tree.yview,
+        )
+        xscrollbar = ttk.Scrollbar(
+            table_frame,
+            orient="horizontal",
+            command=self.db_jobs_tree.xview,
+        )
+        self.db_jobs_tree.configure(
+            yscrollcommand=yscrollbar.set,
+            xscrollcommand=xscrollbar.set,
+        )
+
+        self.db_jobs_tree.grid(row=0, column=0, sticky="nsew")
+        yscrollbar.grid(row=0, column=1, sticky="ns")
+        xscrollbar.grid(row=1, column=0, sticky="ew")
+        table_frame.columnconfigure(0, weight=1)
+        table_frame.rowconfigure(0, weight=1)
+
     def update_checkerboard_scroll_region(self, _event=None):
         self.container_canvas.configure(scrollregion=self.container_canvas.bbox("all"))
 
@@ -1171,6 +1393,120 @@ class DockerMonitorApp:
             wraplength=wraplength,
         ).pack(fill="x", padx=10)
 
+    def refresh_db_jobs(self):
+        if self.db_query_running:
+            return
+
+        password = self.current_db_password()
+        if not password:
+            self.notebook.select(self.db_tab)
+            self.set_db_status(
+                "Enter the reveal SSH password before refreshing jobs.",
+                "red",
+            )
+            self.db_password_entry.focus_set()
+            return
+
+        self.db_query_running = True
+        self.db_refresh_button.configure(state="disabled")
+        self.set_db_status(
+            f"Querying {DB_NAME} on {DB_SSH_USERNAME}@{DB_SSH_HOST}...",
+            "black",
+        )
+
+        thread = threading.Thread(
+            target=self.db_jobs_worker,
+            args=(password,),
+            daemon=True,
+        )
+        thread.start()
+
+    def current_db_password(self):
+        password = self.db_password_var.get()
+        if password:
+            return password
+
+        return os.getenv(DB_SSH_PASSWORD_ENV)
+
+    def db_jobs_worker(self, password):
+        try:
+            command = db_jobs_command()
+            exit_code, output, error = run_remote_command(
+                command,
+                host=DB_SSH_HOST,
+                port=DB_SSH_PORT,
+                username=DB_SSH_USERNAME,
+                password=password,
+            )
+            result = {
+                "ok": exit_code == 0,
+                "exit_code": exit_code,
+                "command": command,
+                "output": output,
+                "error": error,
+            }
+
+            if exit_code == 0:
+                result["rows"] = parse_db_jobs_output(output)
+        except Exception as exc:
+            result = {
+                "ok": False,
+                "exception": str(exc),
+            }
+
+        try:
+            self.root.after(0, lambda: self.finish_db_jobs_query(result))
+        except RuntimeError:
+            pass
+
+    def finish_db_jobs_query(self, result):
+        self.db_query_running = False
+        self.db_refresh_button.configure(state="normal")
+
+        if not result["ok"]:
+            message = remote_command_failure_message(result)
+            if "SSH authentication failed" in message:
+                self.clear_db_password(update_status=False)
+
+            self.set_db_status(f"DB query failed: {message}", "red")
+            return
+
+        rows = result["rows"]
+        self.render_db_jobs(rows)
+
+        error = result.get("error", "").strip()
+        if error:
+            self.set_db_status(
+                f"Loaded {len(rows)} job rows. Remote stderr: {error}",
+                "black",
+            )
+        else:
+            self.set_db_status(f"Loaded {len(rows)} job rows.", "green")
+
+    def render_db_jobs(self, rows):
+        for item in self.db_jobs_tree.get_children():
+            self.db_jobs_tree.delete(item)
+
+        for row in rows:
+            self.db_jobs_tree.insert(
+                "",
+                "end",
+                values=(
+                    row.get("model", ""),
+                    row.get("image", ""),
+                ),
+            )
+
+    def set_db_status(self, message, color):
+        self.db_status_var.set(message)
+        self.db_status_label.configure(fg=color)
+
+    def clear_db_password(self, update_status=True):
+        self.db_password_var.set("")
+        if update_status:
+            self.set_db_status("Reveal SSH password cleared.", "black")
+        self.db_password_entry.focus_set()
+
     def check_now(self):
         self.cancel_next_check()
         self.start_check()
@@ -1238,6 +1574,7 @@ class DockerMonitorApp:
             result = {
                 "ok": exit_code == 0,
                 "exit_code": exit_code,
+                "command": REMOTE_CMD,
                 "error": error,
                 "output": output,
             }
@@ -1265,7 +1602,7 @@ class DockerMonitorApp:
         self.check_button.configure(state="normal")
 
         if not result["ok"]:
-            message = result.get("exception") or f"Remote command exited with {result['exit_code']}."
+            message = remote_command_failure_message(result)
             auth_failed = "SSH authentication failed" in message
 
             if auth_failed:
