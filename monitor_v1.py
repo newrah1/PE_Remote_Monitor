@@ -2,11 +2,15 @@ import csv
 import json
 import getpass
 import os
+import smtplib
+import ssl
 import sys
 import threading
 import time
 import webbrowser
 from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
+from email.utils import formataddr, parseaddr
 import paramiko
 
 try:
@@ -41,6 +45,13 @@ DASHBOARD_LINKS = (
 )
 DASHBOARD_BUTTON_BG = "#2e7d32"
 DASHBOARD_BUTTON_ACTIVE_BG = "#1b5e20"
+SMTP_HOST_ENV = "PE_MONITOR_SMTP_HOST"
+SMTP_PORT_ENV = "PE_MONITOR_SMTP_PORT"
+SMTP_USERNAME_ENV = "PE_MONITOR_SMTP_USERNAME"
+SMTP_PASSWORD_ENV = "PE_MONITOR_SMTP_PASSWORD"
+SMTP_FROM_ENV = "PE_MONITOR_SMTP_FROM"
+SMTP_USE_TLS_ENV = "PE_MONITOR_SMTP_USE_TLS"
+SMTP_USE_SSL_ENV = "PE_MONITOR_SMTP_USE_SSL"
 
 WATCH = True
 INTERVAL_SECONDS = 30
@@ -221,6 +232,77 @@ def get_ssh_password(username=USERNAME, host=HOST):
 def clear_cached_password():
     global CACHED_PASSWORD
     CACHED_PASSWORD = None
+
+
+def env_bool(name, default=False):
+    value = os.getenv(name)
+    if value is None:
+        return default
+
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def valid_email_address(email):
+    parsed = parseaddr(email)[1]
+    if parsed != email.strip():
+        return False
+
+    local, separator, domain = parsed.partition("@")
+    return bool(local and separator and "." in domain)
+
+
+def smtp_port(use_tls, use_ssl):
+    configured_port = os.getenv(SMTP_PORT_ENV)
+    if configured_port:
+        return int(configured_port)
+
+    if use_ssl:
+        return 465
+
+    if use_tls:
+        return 587
+
+    return 25
+
+
+def send_email(to_address, subject, body, recipient_name=None):
+    smtp_host = os.getenv(SMTP_HOST_ENV)
+    if not smtp_host:
+        raise RuntimeError(f"Set {SMTP_HOST_ENV} before sending alert email.")
+
+    configured_port = os.getenv(SMTP_PORT_ENV)
+    use_ssl = env_bool(SMTP_USE_SSL_ENV, default=configured_port == "465")
+    use_tls = env_bool(
+        SMTP_USE_TLS_ENV,
+        default=not use_ssl and configured_port != "25",
+    )
+    username = os.getenv(SMTP_USERNAME_ENV)
+    password = os.getenv(SMTP_PASSWORD_ENV)
+    from_address = os.getenv(SMTP_FROM_ENV) or username or "pe-monitor@localhost"
+    port = smtp_port(use_tls, use_ssl)
+
+    message = EmailMessage()
+    message["From"] = formataddr(("PE Monitor", from_address))
+    message["To"] = formataddr((recipient_name or "", to_address))
+    message["Subject"] = subject
+    message.set_content(body)
+
+    context = ssl.create_default_context()
+    if use_ssl:
+        with smtplib.SMTP_SSL(smtp_host, port, timeout=15, context=context) as server:
+            if username:
+                server.login(username, password or "")
+            server.send_message(message)
+        return
+
+    with smtplib.SMTP(smtp_host, port, timeout=15) as server:
+        server.ehlo()
+        if use_tls:
+            server.starttls(context=context)
+            server.ehlo()
+        if username:
+            server.login(username, password or "")
+        server.send_message(message)
 
 
 def run_remote_command(command, username=None, password=None, host=None):
@@ -474,6 +556,7 @@ class DockerMonitorApp:
         self.last_containers = None
         self.last_gpus = None
         self.last_gpu_available = False
+        self.container_alert_snapshot = None
 
         self.selected_host_var = tk.StringVar(value=HOST_CHOICES[0])
         self.username_var = tk.StringVar(value=USERNAME)
@@ -489,6 +572,10 @@ class DockerMonitorApp:
         self.gpu_status_var = tk.StringVar(value="GPU status: UNKNOWN")
         self.gpu_count_var = tk.StringVar(value="GPUs: unknown")
         self.refresh_var = tk.StringVar(value=f"Auto refresh: {INTERVAL_SECONDS}s")
+        self.alert_first_name_var = tk.StringVar()
+        self.alert_last_name_var = tk.StringVar()
+        self.alert_email_var = tk.StringVar()
+        self.alert_status_var = tk.StringVar(value="Enter alert contact details.")
         self.clock_timezone_vars = [
             tk.StringVar(value=timezone_name)
             for timezone_name in DEFAULT_CLOCK_TIMEZONES
@@ -511,14 +598,17 @@ class DockerMonitorApp:
         self.connection_tab = ttk.Frame(self.notebook, padding=18)
         self.containers_tab = ttk.Frame(self.notebook, padding=18)
         self.gpus_tab = ttk.Frame(self.notebook, padding=18)
+        self.alerts_tab = ttk.Frame(self.notebook, padding=18)
 
         self.notebook.add(self.connection_tab, text="Connection")
         self.notebook.add(self.containers_tab, text="Containers")
         self.notebook.add(self.gpus_tab, text="GPUs")
+        self.notebook.add(self.alerts_tab, text="Alerts")
 
         self.build_connection_tab()
         self.build_containers_tab()
         self.build_gpus_tab()
+        self.build_alerts_tab()
 
     def build_clock_bar(self, parent, layout="pack"):
         clock_bar = ttk.Frame(parent)
@@ -766,6 +856,56 @@ class DockerMonitorApp:
         scrollbar.grid(row=0, column=1, sticky="ns")
         gpu_frame.columnconfigure(0, weight=1)
         gpu_frame.rowconfigure(0, weight=1)
+
+    def build_alerts_tab(self):
+        self.build_clock_bar(self.alerts_tab, layout="grid")
+
+        form = ttk.Frame(self.alerts_tab)
+        form.grid(row=1, column=0, sticky="ew")
+        self.alerts_tab.columnconfigure(0, weight=1)
+
+        ttk.Label(form, text="First Name").grid(row=0, column=0, sticky="w", pady=5)
+        ttk.Entry(form, textvariable=self.alert_first_name_var).grid(
+            row=0,
+            column=1,
+            sticky="ew",
+            pady=5,
+        )
+
+        ttk.Label(form, text="Last Name").grid(row=1, column=0, sticky="w", pady=5)
+        ttk.Entry(form, textvariable=self.alert_last_name_var).grid(
+            row=1,
+            column=1,
+            sticky="ew",
+            pady=5,
+        )
+
+        ttk.Label(form, text="Email").grid(row=2, column=0, sticky="w", pady=5)
+        self.alert_email_entry = ttk.Entry(
+            form,
+            textvariable=self.alert_email_var,
+        )
+        self.alert_email_entry.grid(row=2, column=1, sticky="ew", pady=5)
+        self.alert_email_entry.bind("<Return>", lambda _event: self.send_test_alert_email())
+
+        form.columnconfigure(1, weight=1)
+
+        buttons = ttk.Frame(self.alerts_tab)
+        buttons.grid(row=2, column=0, sticky="w", pady=(18, 8))
+
+        ttk.Button(
+            buttons,
+            text="Send Test Email",
+            command=self.send_test_alert_email,
+        ).grid(row=0, column=0, padx=(0, 8))
+
+        self.alert_status_label = tk.Label(
+            self.alerts_tab,
+            textvariable=self.alert_status_var,
+            anchor="w",
+            fg="black",
+        )
+        self.alert_status_label.grid(row=3, column=0, sticky="ew")
 
     def update_checkerboard_scroll_region(self, _event=None):
         self.container_canvas.configure(scrollregion=self.container_canvas.bbox("all"))
@@ -1174,6 +1314,7 @@ class DockerMonitorApp:
             f"paused={info.get('ContainersPaused', 'unknown')}, "
             f"stopped={info.get('ContainersStopped', 'unknown')}"
         )
+        self.process_container_alerts(info, containers)
         self.last_containers = containers
         self.render_container_tiles()
 
@@ -1206,6 +1347,195 @@ class DockerMonitorApp:
         for index, container in enumerate(containers):
             row, column = divmod(index, columns)
             self.add_container_tile(row, column, container, tile_width, tile_height)
+
+    def alert_contact(self, update_status=True):
+        first_name = self.alert_first_name_var.get().strip()
+        last_name = self.alert_last_name_var.get().strip()
+        email = self.alert_email_var.get().strip()
+
+        if not first_name or not last_name or not email:
+            if update_status:
+                self.set_alert_status(
+                    "Enter first name, last name, and email before alerts can send.",
+                    "red",
+                )
+            return None
+
+        if not valid_email_address(email):
+            if update_status:
+                self.set_alert_status("Enter a valid email address.", "red")
+                self.alert_email_entry.focus_set()
+            return None
+
+        return first_name, last_name, email
+
+    def send_test_alert_email(self):
+        contact = self.alert_contact()
+        if not contact:
+            return
+
+        first_name, last_name, email = contact
+        recipient_name = f"{first_name} {last_name}"
+        checked_at = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+        body = (
+            f"Hello {recipient_name},\n\n"
+            "This is a test email from PE Monitor.\n\n"
+            f"SSH host: {self.current_host()}\n"
+            f"Sent: {checked_at}\n"
+        )
+
+        self.set_alert_status(f"Sending test email to {email}...", "black")
+        self.send_email_async(
+            email,
+            "PE Monitor Test Alert",
+            body,
+            recipient_name,
+            f"Test email sent to {email}.",
+            "Test email failed",
+        )
+
+    def send_email_async(
+        self,
+        to_address,
+        subject,
+        body,
+        recipient_name,
+        success_message,
+        failure_prefix,
+    ):
+        def worker():
+            try:
+                send_email(to_address, subject, body, recipient_name)
+                error = None
+            except Exception as exc:
+                error = str(exc)
+
+            try:
+                self.root.after(
+                    0,
+                    lambda: self.finish_email_send(
+                        error,
+                        success_message,
+                        failure_prefix,
+                    ),
+                )
+            except RuntimeError:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def finish_email_send(self, error, success_message, failure_prefix):
+        if error:
+            self.set_alert_status(f"{failure_prefix}: {error}", "red")
+            return
+
+        self.set_alert_status(success_message, "green")
+
+    def container_alert_key(self, container):
+        return (
+            container.get("ID")
+            or container.get("Names")
+            or container.get("Image")
+            or json.dumps(container, sort_keys=True)
+        )
+
+    def container_alert_entry(self, container):
+        return {
+            "key": self.container_alert_key(container),
+            "name": container.get("Names", "<unknown>"),
+            "image": container.get("Image", "<unknown>"),
+            "state": container_state(container),
+            "status": container.get("Status", ""),
+            "healthy": container_is_healthy(container),
+        }
+
+    def process_container_alerts(self, info, containers):
+        current_snapshot = {
+            self.container_alert_key(container): self.container_alert_entry(container)
+            for container in containers
+        }
+        previous_snapshot = self.container_alert_snapshot
+        down_events = []
+
+        if previous_snapshot is None:
+            down_events = [
+                entry for entry in current_snapshot.values() if not entry["healthy"]
+            ]
+        else:
+            for key, entry in current_snapshot.items():
+                previous_entry = previous_snapshot.get(key)
+                if previous_entry and previous_entry["healthy"] and not entry["healthy"]:
+                    down_events.append(entry)
+
+            for key, previous_entry in previous_snapshot.items():
+                if key in current_snapshot or not previous_entry["healthy"]:
+                    continue
+
+                down_events.append(
+                    {
+                        **previous_entry,
+                        "state": "MISSING",
+                        "status": "Container no longer returned by docker ps -a.",
+                        "healthy": False,
+                    }
+                )
+
+        if down_events and not self.send_container_down_alert(info, down_events):
+            return
+
+        self.container_alert_snapshot = current_snapshot
+
+    def send_container_down_alert(self, info, down_events):
+        contact = self.alert_contact()
+        if not contact:
+            return False
+
+        first_name, last_name, email = contact
+        recipient_name = f"{first_name} {last_name}"
+        host_name = info.get("Name", "unknown")
+        subject = self.container_down_subject(host_name, down_events)
+        body = self.container_down_body(recipient_name, host_name, down_events)
+
+        self.set_alert_status(f"Sending container alert to {email}...", "black")
+        self.send_email_async(
+            email,
+            subject,
+            body,
+            recipient_name,
+            f"Container alert sent to {email}.",
+            "Container alert failed",
+        )
+        return True
+
+    def container_down_subject(self, host_name, down_events):
+        container_word = "container" if len(down_events) == 1 else "containers"
+        return (
+            f"PE Monitor Alert: {len(down_events)} {container_word} down "
+            f"on {host_name}"
+        )
+
+    def container_down_body(self, recipient_name, host_name, down_events):
+        checked_at = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+        lines = [
+            f"Hello {recipient_name},",
+            "",
+            "PE Monitor detected container status problems.",
+            "",
+            f"SSH host: {self.current_host()}",
+            f"Docker host: {host_name}",
+            f"Checked: {checked_at}",
+            "",
+            "Affected containers:",
+        ]
+
+        for entry in down_events:
+            lines.append(
+                f"- {entry['name']} | State: {entry['state']} | "
+                f"Status: {entry['status']}"
+            )
+
+        lines.extend(["", "This message was generated by PE Monitor."])
+        return "\n".join(lines)
 
     def update_gpu_status(self, gpus, gpu_available):
         if not gpu_available:
@@ -1253,6 +1583,10 @@ class DockerMonitorApp:
     def set_connection_status(self, message, color):
         self.connection_status_var.set(message)
         self.connection_status_label.configure(fg=color)
+
+    def set_alert_status(self, message, color):
+        self.alert_status_var.set(message)
+        self.alert_status_label.configure(fg=color)
 
     def set_docker_status(self, status):
         self.docker_status_var.set(f"Docker status: {status}")
