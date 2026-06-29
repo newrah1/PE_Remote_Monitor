@@ -5,6 +5,7 @@ import os
 import sys
 import threading
 import time
+import webbrowser
 from datetime import datetime, timedelta, timezone
 import paramiko
 
@@ -34,6 +35,12 @@ PORT = 22
 USERNAME = "pgat.dnew"
 PASSWORD = None  # Leave as None to prompt securely.
 CACHED_PASSWORD = None
+DASHBOARD_LINKS = (
+    ("USARPAC", "https://prometheus.ds.maxar.com:3001"),
+    ("Ft Gordon", "https://magneto.ds.maxar.com:3001"),
+)
+DASHBOARD_BUTTON_BG = "#2e7d32"
+DASHBOARD_BUTTON_ACTIVE_BG = "#1b5e20"
 
 WATCH = True
 INTERVAL_SECONDS = 30
@@ -582,6 +589,7 @@ class DockerMonitorApp:
         form = ttk.Frame(self.connection_tab)
         form.grid(row=1, column=0, sticky="ew")
         self.connection_tab.columnconfigure(0, weight=1)
+        self.connection_tab.rowconfigure(5, weight=1)
 
         ttk.Label(form, text="Host").grid(row=0, column=0, sticky="w", pady=5)
         self.host_combo = ttk.Combobox(
@@ -616,6 +624,7 @@ class DockerMonitorApp:
         ttk.Button(buttons, text="Clear Password", command=self.clear_password).grid(
             row=0,
             column=1,
+            padx=(0, 8),
         )
 
         ttk.Label(self.connection_tab, textvariable=self.refresh_var).grid(
@@ -632,6 +641,30 @@ class DockerMonitorApp:
             fg="black",
         )
         self.connection_status_label.grid(row=4, column=0, sticky="ew")
+
+        dashboard_buttons = ttk.Frame(self.connection_tab)
+        dashboard_buttons.grid(row=6, column=0, sticky="sw", pady=(18, 0))
+
+        for column, (label, url) in enumerate(DASHBOARD_LINKS):
+            tk.Button(
+                dashboard_buttons,
+                text=label,
+                command=lambda link_label=label, link_url=url: self.open_dashboard(
+                    link_label,
+                    link_url,
+                ),
+                bg=DASHBOARD_BUTTON_BG,
+                fg="white",
+                activebackground=DASHBOARD_BUTTON_ACTIVE_BG,
+                activeforeground="white",
+                padx=12,
+                pady=4,
+                cursor="hand2",
+            ).grid(row=0, column=column, padx=(0, 8))
+
+    def open_dashboard(self, label, url):
+        webbrowser.open_new(url)
+        self.set_connection_status(f"Opening {label}: {url}", "black")
 
     def build_containers_tab(self):
         self.build_clock_bar(self.containers_tab)
