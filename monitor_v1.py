@@ -63,6 +63,11 @@ DB_PSQL_CONTAINER_ENV = "PE_MONITOR_PSQL_CONTAINER"
 DB_DEFAULT_PSQL_CONTAINER = "deepcore-postgres-1"
 DCS_JOB_KEY_COLUMN = "job_key"
 PE_CONFIG_DOCKER_COMPOSE_LOC = "/opt/prometheus/docker-compose.yml"
+PE_CONFIG_DOCKER_COMPOSE_LOCS = (
+    PE_CONFIG_DOCKER_COMPOSE_LOC,
+    "/opt/prometheus/docker-compose.prod.yml",
+    "/opt/prometheus/docker-compose.dev.yml",
+)
 PE_CONFIG_SERVICE_NAMES = (
     "activemq",
     "core",
@@ -453,10 +458,10 @@ def inference_submitted_command(inference_job_ids):
     return db_json_query_command(INFERENCE_DB_NAME, query)
 
 
-def pe_config_command():
-    compose_path = shlex.quote(PE_CONFIG_DOCKER_COMPOSE_LOC)
-    missing_message = shlex.quote(f"{PE_CONFIG_DOCKER_COMPOSE_LOC} does not exist")
-    unreadable_message = shlex.quote(f"{PE_CONFIG_DOCKER_COMPOSE_LOC} is not readable")
+def pe_config_command(docker_compose_loc):
+    compose_path = shlex.quote(docker_compose_loc)
+    missing_message = shlex.quote(f"{docker_compose_loc} does not exist")
+    unreadable_message = shlex.quote(f"{docker_compose_loc} is not readable")
     return (
         f"if [ -r {compose_path} ]; then "
         f"cat {compose_path}; "
@@ -967,6 +972,9 @@ class DockerMonitorApp:
         self.db_status_var = tk.StringVar(
             value="Uses the Connection tab SSH credentials. Click Refresh to query jobs."
         )
+        self.pe_config_compose_path_var = tk.StringVar(
+            value=PE_CONFIG_DOCKER_COMPOSE_LOC
+        )
         self.pe_config_status_var = tk.StringVar(
             value=f"Click Refresh to load {PE_CONFIG_DOCKER_COMPOSE_LOC}."
         )
@@ -1460,11 +1468,21 @@ class DockerMonitorApp:
         )
 
         ttk.Label(form, text="Compose File").grid(row=1, column=0, sticky="w", pady=5)
-        ttk.Label(form, text=PE_CONFIG_DOCKER_COMPOSE_LOC).grid(
+        self.pe_config_compose_path_entry = ttk.Combobox(
+            form,
+            textvariable=self.pe_config_compose_path_var,
+            values=PE_CONFIG_DOCKER_COMPOSE_LOCS,
+            state="normal",
+        )
+        self.pe_config_compose_path_entry.grid(
             row=1,
             column=1,
-            sticky="w",
+            sticky="ew",
             pady=5,
+        )
+        self.pe_config_compose_path_entry.bind(
+            "<Return>",
+            lambda _event: self.refresh_pe_config(),
         )
 
         buttons = ttk.Frame(form)
@@ -1981,6 +1999,15 @@ class DockerMonitorApp:
         host = self.current_host()
         username = self.username_var.get().strip()
         password = self.current_password()
+        docker_compose_loc = self.pe_config_compose_path_var.get().strip()
+
+        if not docker_compose_loc:
+            self.set_pe_config_status(
+                "Enter a docker-compose.yml path before refreshing PE Config.",
+                "red",
+            )
+            self.pe_config_compose_path_entry.focus_set()
+            return
 
         if not username:
             self.set_pe_config_status(
@@ -2011,20 +2038,20 @@ class DockerMonitorApp:
         self.pe_config_running = True
         self.pe_config_refresh_button.configure(state="disabled")
         self.set_pe_config_status(
-            f"Loading {PE_CONFIG_DOCKER_COMPOSE_LOC} from {host}...",
+            f"Loading {docker_compose_loc} from {host}...",
             "black",
         )
 
         thread = threading.Thread(
             target=self.pe_config_worker,
-            args=(host, username, password),
+            args=(host, username, password, docker_compose_loc),
             daemon=True,
         )
         thread.start()
 
-    def pe_config_worker(self, host, username, password):
+    def pe_config_worker(self, host, username, password, docker_compose_loc):
         try:
-            command = pe_config_command()
+            command = pe_config_command(docker_compose_loc)
             exit_code, output, error = run_remote_command(
                 command,
                 host=host,
@@ -2041,6 +2068,7 @@ class DockerMonitorApp:
 
             if exit_code == 0:
                 result["rows"] = pe_config_rows(output)
+                result["docker_compose_loc"] = docker_compose_loc
         except Exception as exc:
             result = {
                 "ok": False,
@@ -2069,8 +2097,12 @@ class DockerMonitorApp:
 
         loaded_count = sum(1 for row in rows if row.get("image") and not row.get("missing"))
         missing_count = sum(1 for row in rows if row.get("missing"))
+        docker_compose_loc = result.get(
+            "docker_compose_loc",
+            self.pe_config_compose_path_var.get().strip(),
+        )
         loaded_message = (
-            f"Loaded {loaded_count} image values from {PE_CONFIG_DOCKER_COMPOSE_LOC}."
+            f"Loaded {loaded_count} image values from {docker_compose_loc}."
         )
         if missing_count:
             loaded_message = (
