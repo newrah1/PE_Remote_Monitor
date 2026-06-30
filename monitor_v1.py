@@ -54,24 +54,37 @@ DB_SSH_HOST = "10.194.78.12"
 DB_SSH_PORT = 22
 DB_SSH_USERNAME = "pgat.dnew"
 DB_NAME = "dcs"
+INFERENCE_DB_NAME = "inference"
 DB_USERNAME = "reveal"
 DB_SSH_PASSWORD_ENV = "PE_MONITOR_DB_SSH_PASSWORD"
 DB_PSQL_COMMAND_ENV = "PE_MONITOR_PSQL_COMMAND"
 DB_PSQL_CONTAINER_ENV = "PE_MONITOR_PSQL_CONTAINER"
 DB_DEFAULT_PSQL_CONTAINER = "deepcore-postgres-1"
-DB_JOBS_QUERY = """
+DCS_RUNNER_JOB_ID_CANDIDATES = (
+    "runner_job_id",
+    "runnerjobid",
+    "runnerjob_id",
+    "runner_job",
+    "runner_jobid",
+    "runnerid",
+    "job_runner_id",
+    "job_id",
+    "jobid",
+)
+DCS_JOBS_QUERY_TEMPLATE = """
 select
-  state,
-  jobrequest::jsonb ->> 'model' as model,
-  jobrequest::jsonb #>> '{image,url}' as image,
-  timeelapsed as timeselapsed
-from jobs
-where state in ('Running', 'Queued')
-  and jobrequest like '{%'
+  dcs_job.{runner_job_column}::text as runner_job_id,
+  dcs_job.state,
+  dcs_job.jobrequest::jsonb ->> 'model' as model,
+  dcs_job.jobrequest::jsonb #>> '{{image,url}}' as image,
+  dcs_job.timeelapsed as timeselapsed
+from jobs dcs_job
+where dcs_job.state in ('Running', 'Queued')
+  and dcs_job.jobrequest like '{{%'
 order by
   case
-    when state = 'Running' then 1
-    when state = 'Queued' then 2
+    when dcs_job.state = 'Running' then 1
+    when dcs_job.state = 'Queued' then 2
   end
 """
 
@@ -385,16 +398,67 @@ def db_psql_command_prefix():
     )
 
 
-def db_jobs_command():
+def sql_literal(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def sql_identifier(value):
+    return '"' + str(value).replace('"', '""') + '"'
+
+
+def db_json_query_command(database, query):
     wrapped_query = (
         "select coalesce(json_agg(row_to_json(job_rows)), '[]'::json) "
-        f"from ({DB_JOBS_QUERY}) job_rows"
+        f"from ({query}) job_rows"
     )
     return (
         f"{db_psql_command_prefix()} -U {shlex.quote(DB_USERNAME)} "
-        f"-d {shlex.quote(DB_NAME)} -X -q -t -A "
+        f"-d {shlex.quote(database)} -X -q -t -A "
         f"--set ON_ERROR_STOP=1 -c {shlex.quote(wrapped_query)}"
     )
+
+
+def dcs_jobs_columns_command():
+    query = (
+        "select column_name "
+        "from information_schema.columns "
+        "where table_name = 'jobs' "
+        "order by ordinal_position"
+    )
+    return db_json_query_command(DB_NAME, query)
+
+
+def dcs_runner_job_column(columns):
+    normalized_columns = {column.lower(): column for column in columns}
+    for candidate in DCS_RUNNER_JOB_ID_CANDIDATES:
+        if candidate in normalized_columns:
+            return normalized_columns[candidate]
+
+    return None
+
+
+def db_jobs_query(runner_job_column):
+    return DCS_JOBS_QUERY_TEMPLATE.format(
+        runner_job_column=sql_identifier(runner_job_column),
+    )
+
+
+def db_jobs_command(runner_job_column):
+    return db_json_query_command(DB_NAME, db_jobs_query(runner_job_column))
+
+
+def inference_submitted_command(runner_job_ids):
+    ids = [str(runner_job_id) for runner_job_id in runner_job_ids if runner_job_id]
+    if not ids:
+        return None
+
+    ids_sql = ", ".join(sql_literal(runner_job_id) for runner_job_id in ids)
+    query = (
+        "select runner_job_id::text as runner_job_id, submitted_on "
+        "from job "
+        f"where runner_job_id in ({ids_sql})"
+    )
+    return db_json_query_command(INFERENCE_DB_NAME, query)
 
 
 def parse_db_jobs_output(output):
@@ -407,6 +471,24 @@ def parse_db_jobs_output(output):
         raise RuntimeError("Database query did not return a JSON row list.")
 
     return rows
+
+
+def merge_submitted_on(dcs_rows, inference_rows):
+    submitted_by_runner_job_id = {
+        str(row.get("runner_job_id")): row.get("submitted_on", "")
+        for row in inference_rows
+        if row.get("runner_job_id")
+    }
+
+    for row in dcs_rows:
+        runner_job_id = row.get("runner_job_id")
+        row["submitted_on"] = submitted_by_runner_job_id.get(str(runner_job_id), "")
+
+    return dcs_rows
+
+
+def submitted_on_match_count(rows):
+    return sum(1 for row in rows if row.get("submitted_on"))
 
 
 def path_basename(value):
@@ -796,7 +878,7 @@ class DockerMonitorApp:
         self.notebook.add(self.containers_tab, text="Containers")
         self.notebook.add(self.gpus_tab, text="GPUs")
         self.notebook.add(self.alerts_tab, text="Alerts")
-        self.notebook.add(self.db_tab, text="DCS Jobs")
+        self.notebook.add(self.db_tab, text="Active Inference")
 
         self.build_connection_tab()
         self.build_containers_tab()
@@ -1158,18 +1240,21 @@ class DockerMonitorApp:
 
         self.db_jobs_tree = ttk.Treeview(
             table_frame,
-            columns=("state", "timeselapsed", "model", "image"),
+            columns=("state", "timeselapsed", "submitted_on", "model", "image"),
             show="headings",
         )
         self.db_jobs_tree.heading("state", text="State")
         self.db_jobs_tree.heading("timeselapsed", text="Time Elapsed")
+        self.db_jobs_tree.heading("submitted_on", text="Submitted On")
         self.db_jobs_tree.heading("model", text="Model")
         self.db_jobs_tree.heading("image", text="Image")
         self.db_jobs_tree.column("state", width=110, minwidth=90, stretch=False)
         self.db_jobs_tree.column("timeselapsed", width=120, minwidth=100, stretch=False)
+        self.db_jobs_tree.column("submitted_on", width=180, minwidth=140, stretch=False)
         self.db_jobs_tree.column("model", width=360, minwidth=180, stretch=True)
         self.db_jobs_tree.column("image", width=520, minwidth=220, stretch=True)
         self.db_jobs_tree.tag_configure("running", background="#15803d", foreground="white")
+        self.db_jobs_tree.tag_configure("queued", background="#fde047", foreground="black")
 
         yscrollbar = ttk.Scrollbar(
             table_frame,
@@ -1493,7 +1578,36 @@ class DockerMonitorApp:
 
     def db_jobs_worker(self, password):
         try:
-            command = db_jobs_command()
+            columns_command = dcs_jobs_columns_command()
+            columns_exit_code, columns_output, columns_error = run_remote_command(
+                columns_command,
+                host=DB_SSH_HOST,
+                port=DB_SSH_PORT,
+                username=DB_SSH_USERNAME,
+                password=password,
+            )
+
+            if columns_exit_code != 0:
+                result = {
+                    "ok": False,
+                    "exit_code": columns_exit_code,
+                    "command": columns_command,
+                    "output": columns_output,
+                    "error": columns_error,
+                }
+                self.root.after(0, lambda: self.finish_db_jobs_query(result))
+                return
+
+            column_rows = parse_db_jobs_output(columns_output)
+            columns = [row.get("column_name", "") for row in column_rows]
+            runner_job_column = dcs_runner_job_column(columns)
+            if not runner_job_column:
+                raise RuntimeError(
+                    "No runner-job id column was found in dcs.jobs. "
+                    f"Available columns: {', '.join(columns)}"
+                )
+
+            command = db_jobs_command(runner_job_column)
             exit_code, output, error = run_remote_command(
                 command,
                 host=DB_SSH_HOST,
@@ -1510,7 +1624,38 @@ class DockerMonitorApp:
             }
 
             if exit_code == 0:
-                result["rows"] = parse_db_jobs_output(output)
+                rows = parse_db_jobs_output(output)
+                inference_command = inference_submitted_command(
+                    row.get("runner_job_id") for row in rows
+                )
+
+                if inference_command:
+                    inference_exit_code, inference_output, inference_error = run_remote_command(
+                        inference_command,
+                        host=DB_SSH_HOST,
+                        port=DB_SSH_PORT,
+                        username=DB_SSH_USERNAME,
+                        password=password,
+                    )
+
+                    if inference_exit_code != 0:
+                        result = {
+                            "ok": False,
+                            "exit_code": inference_exit_code,
+                            "command": inference_command,
+                            "output": inference_output,
+                            "error": inference_error,
+                        }
+                    else:
+                        inference_rows = parse_db_jobs_output(inference_output)
+                        result["rows"] = merge_submitted_on(rows, inference_rows)
+                        result["error"] = "\n".join(
+                            text
+                            for text in (columns_error, error, inference_error)
+                            if text
+                        )
+                else:
+                    result["rows"] = rows
         except Exception as exc:
             result = {
                 "ok": False,
@@ -1538,13 +1683,18 @@ class DockerMonitorApp:
         self.render_db_jobs(rows)
 
         error = result.get("error", "").strip()
+        submitted_matches = submitted_on_match_count(rows)
+        loaded_message = (
+            f"Loaded {len(rows)} job rows. Submitted On matched "
+            f"{submitted_matches}/{len(rows)}."
+        )
         if error:
             self.set_db_status(
-                f"Loaded {len(rows)} job rows. Remote stderr: {error}",
+                f"{loaded_message} Remote stderr: {error}",
                 "black",
             )
         else:
-            self.set_db_status(f"Loaded {len(rows)} job rows.", "green")
+            self.set_db_status(loaded_message, "green")
 
     def render_db_jobs(self, rows):
         for item in self.db_jobs_tree.get_children():
@@ -1563,13 +1713,23 @@ class DockerMonitorApp:
                 values=(
                     state,
                     format_elapsed(row.get("timeselapsed", "")),
+                    row.get("submitted_on", ""),
                     model,
                     image,
                 ),
-                tags=("running",) if str(state).lower() == "running" else (),
+                tags=self.db_state_tags(state),
             )
 
         self.resize_db_model_column(model_values)
+
+    def db_state_tags(self, state):
+        normalized_state = str(state).lower()
+        if normalized_state == "running":
+            return ("running",)
+        if normalized_state == "queued":
+            return ("queued",)
+
+        return ()
 
     def resize_db_model_column(self, model_values):
         values = ["Model", *model_values]
