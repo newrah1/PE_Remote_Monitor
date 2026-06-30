@@ -18,6 +18,11 @@ import paramiko
 logging.getLogger("paramiko.transport").setLevel(logging.CRITICAL)
 
 try:
+    import yaml
+except ImportError:
+    yaml = None
+
+try:
     from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 except ImportError:
     ZoneInfo = None
@@ -50,30 +55,36 @@ DASHBOARD_LINKS = (
 )
 DASHBOARD_BUTTON_BG = "#2e7d32"
 DASHBOARD_BUTTON_ACTIVE_BG = "#1b5e20"
-DB_SSH_HOST = "10.194.78.12"
-DB_SSH_PORT = 22
-DB_SSH_USERNAME = "pgat.dnew"
 DB_NAME = "dcs"
 INFERENCE_DB_NAME = "inference"
 DB_USERNAME = "reveal"
-DB_SSH_PASSWORD_ENV = "PE_MONITOR_DB_SSH_PASSWORD"
 DB_PSQL_COMMAND_ENV = "PE_MONITOR_PSQL_COMMAND"
 DB_PSQL_CONTAINER_ENV = "PE_MONITOR_PSQL_CONTAINER"
 DB_DEFAULT_PSQL_CONTAINER = "deepcore-postgres-1"
-DCS_RUNNER_JOB_ID_CANDIDATES = (
-    "runner_job_id",
-    "runnerjobid",
-    "runnerjob_id",
-    "runner_job",
-    "runner_jobid",
-    "runnerid",
-    "job_runner_id",
-    "job_id",
-    "jobid",
+DCS_JOB_KEY_COLUMN = "job_key"
+PE_CONFIG_DOCKER_COMPOSE_LOC = "/opt/prometheus/docker-compose.yml"
+PE_CONFIG_SERVICE_NAMES = (
+    "activemq",
+    "core",
+    "dcs",
+    "imagefactory",
+    "inference",
+    "maxnet",
+    "modelcatalog",
+    "oasis",
+    "oasismonitor",
+    "ontology",
+    "notification",
+    "openldap",
+    "pgadmin",
+    "poi",
+    "postgres",
+    "training",
+    "unifiedui",
 )
 DCS_JOBS_QUERY_TEMPLATE = """
 select
-  dcs_job.{runner_job_column}::text as runner_job_id,
+  dcs_job.{job_key_column}::text as inference_job_id,
   dcs_job.state,
   dcs_job.jobrequest::jsonb ->> 'model' as model,
   dcs_job.jobrequest::jsonb #>> '{{image,url}}' as image,
@@ -418,47 +429,154 @@ def db_json_query_command(database, query):
     )
 
 
-def dcs_jobs_columns_command():
-    query = (
-        "select column_name "
-        "from information_schema.columns "
-        "where table_name = 'jobs' "
-        "order by ordinal_position"
-    )
-    return db_json_query_command(DB_NAME, query)
-
-
-def dcs_runner_job_column(columns):
-    normalized_columns = {column.lower(): column for column in columns}
-    for candidate in DCS_RUNNER_JOB_ID_CANDIDATES:
-        if candidate in normalized_columns:
-            return normalized_columns[candidate]
-
-    return None
-
-
-def db_jobs_query(runner_job_column):
+def db_jobs_query():
     return DCS_JOBS_QUERY_TEMPLATE.format(
-        runner_job_column=sql_identifier(runner_job_column),
+        job_key_column=sql_identifier(DCS_JOB_KEY_COLUMN),
     )
 
 
-def db_jobs_command(runner_job_column):
-    return db_json_query_command(DB_NAME, db_jobs_query(runner_job_column))
+def db_jobs_command():
+    return db_json_query_command(DB_NAME, db_jobs_query())
 
 
-def inference_submitted_command(runner_job_ids):
-    ids = [str(runner_job_id) for runner_job_id in runner_job_ids if runner_job_id]
+def inference_submitted_command(inference_job_ids):
+    ids = [str(inference_job_id) for inference_job_id in inference_job_ids if inference_job_id]
     if not ids:
         return None
 
-    ids_sql = ", ".join(sql_literal(runner_job_id) for runner_job_id in ids)
+    ids_sql = ", ".join(sql_literal(inference_job_id) for inference_job_id in ids)
     query = (
-        "select runner_job_id::text as runner_job_id, submitted_on "
+        "select job_id::text as inference_job_id, submitted_on "
         "from job "
-        f"where runner_job_id in ({ids_sql})"
+        f"where job_id::text in ({ids_sql})"
     )
     return db_json_query_command(INFERENCE_DB_NAME, query)
+
+
+def pe_config_command():
+    compose_path = shlex.quote(PE_CONFIG_DOCKER_COMPOSE_LOC)
+    missing_message = shlex.quote(f"{PE_CONFIG_DOCKER_COMPOSE_LOC} does not exist")
+    unreadable_message = shlex.quote(f"{PE_CONFIG_DOCKER_COMPOSE_LOC} is not readable")
+    return (
+        f"if [ -r {compose_path} ]; then "
+        f"cat {compose_path}; "
+        f"elif [ -e {compose_path} ]; then "
+        f"echo {unreadable_message} >&2; exit 1; "
+        "else "
+        f"echo {missing_message} >&2; exit 1; "
+        "fi"
+    )
+
+
+def strip_simple_yaml_scalar(value):
+    value = value.strip()
+    if not value or value in ("null", "~"):
+        return ""
+
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1]
+
+    return value.split(" #", 1)[0].strip()
+
+
+def parse_compose_services_without_yaml(yaml_text):
+    services = {}
+    in_services = False
+    services_indent = None
+    service_indent = None
+    current_service = None
+    current_service_indent = None
+
+    for raw_line in yaml_text.splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+
+        indent = len(line) - len(line.lstrip(" "))
+        if not in_services:
+            if stripped == "services:":
+                in_services = True
+                services_indent = indent
+            continue
+
+        if indent <= services_indent:
+            break
+
+        if (
+            stripped.endswith(":")
+            and indent > services_indent
+            and (service_indent is None or indent == service_indent)
+        ):
+            service_indent = indent
+            current_service = stripped[:-1].strip().strip("'\"")
+            current_service_indent = indent
+            services.setdefault(current_service, {})
+            continue
+
+        if (
+            current_service
+            and current_service_indent is not None
+            and indent > current_service_indent
+            and stripped.startswith("image:")
+        ):
+            _key, value = stripped.split(":", 1)
+            services[current_service]["image"] = strip_simple_yaml_scalar(value)
+
+    return services
+
+
+def parse_pe_config_yaml(yaml_text):
+    if yaml is not None:
+        data = yaml.safe_load(yaml_text) or {}
+        if not isinstance(data, dict):
+            raise RuntimeError("docker-compose.yml did not contain a YAML mapping.")
+
+        services = data.get("services") or {}
+        if not isinstance(services, dict):
+            raise RuntimeError("docker-compose.yml does not contain a services mapping.")
+
+        return services
+
+    services = parse_compose_services_without_yaml(yaml_text)
+    if not services:
+        raise RuntimeError(
+            "PyYAML is not installed, and the built-in parser could not read "
+            "services from docker-compose.yml."
+        )
+
+    return services
+
+
+def pe_config_key(service_name):
+    return f"{service_name.replace('-', '_')}_image"
+
+
+def pe_config_rows(yaml_text):
+    services = parse_pe_config_yaml(yaml_text)
+    ordered_names = list(PE_CONFIG_SERVICE_NAMES)
+    expected_names = set(ordered_names)
+    ordered_names.extend(
+        sorted(service_name for service_name in services if service_name not in expected_names)
+    )
+
+    rows = []
+    for service_name in ordered_names:
+        service = services.get(service_name)
+        image = ""
+        if isinstance(service, dict):
+            image = service.get("image") or ""
+
+        rows.append(
+            {
+                "key": pe_config_key(service_name),
+                "service": service_name,
+                "image": str(image),
+                "missing": service_name not in services,
+            }
+        )
+
+    return rows
 
 
 def parse_db_jobs_output(output):
@@ -474,15 +592,15 @@ def parse_db_jobs_output(output):
 
 
 def merge_submitted_on(dcs_rows, inference_rows):
-    submitted_by_runner_job_id = {
-        str(row.get("runner_job_id")): row.get("submitted_on", "")
+    submitted_by_inference_job_id = {
+        str(row.get("inference_job_id")): row.get("submitted_on", "")
         for row in inference_rows
-        if row.get("runner_job_id")
+        if row.get("inference_job_id")
     }
 
     for row in dcs_rows:
-        runner_job_id = row.get("runner_job_id")
-        row["submitted_on"] = submitted_by_runner_job_id.get(str(runner_job_id), "")
+        inference_job_id = row.get("inference_job_id")
+        row["submitted_on"] = submitted_by_inference_job_id.get(str(inference_job_id), "")
 
     return dcs_rows
 
@@ -819,6 +937,7 @@ class DockerMonitorApp:
         self.root = root
         self.check_running = False
         self.db_query_running = False
+        self.pe_config_running = False
         self.next_check_id = None
         self.container_resize_id = None
         self.gpu_resize_id = None
@@ -845,9 +964,11 @@ class DockerMonitorApp:
         self.alert_last_name_var = tk.StringVar()
         self.alert_email_var = tk.StringVar()
         self.alert_status_var = tk.StringVar(value="Enter alert contact details.")
-        self.db_password_var = tk.StringVar()
         self.db_status_var = tk.StringVar(
-            value="Enter the reveal SSH password, then click Refresh."
+            value="Uses the Connection tab SSH credentials. Click Refresh to query jobs."
+        )
+        self.pe_config_status_var = tk.StringVar(
+            value=f"Click Refresh to load {PE_CONFIG_DOCKER_COMPOSE_LOC}."
         )
         self.clock_timezone_vars = [
             tk.StringVar(value=timezone_name)
@@ -865,7 +986,9 @@ class DockerMonitorApp:
         self.password_entry.focus_set()
 
     def build_ui(self):
-        self.notebook = ttk.Notebook(self.root)
+        self.configure_styles()
+
+        self.notebook = ttk.Notebook(self.root, style="PE.TNotebook")
         self.notebook.pack(fill="both", expand=True)
 
         self.connection_tab = ttk.Frame(self.notebook, padding=18)
@@ -873,18 +996,58 @@ class DockerMonitorApp:
         self.gpus_tab = ttk.Frame(self.notebook, padding=18)
         self.alerts_tab = ttk.Frame(self.notebook, padding=18)
         self.db_tab = ttk.Frame(self.notebook, padding=18)
+        self.pe_config_tab = ttk.Frame(self.notebook, padding=18)
 
         self.notebook.add(self.connection_tab, text="Connection")
         self.notebook.add(self.containers_tab, text="Containers")
         self.notebook.add(self.gpus_tab, text="GPUs")
         self.notebook.add(self.alerts_tab, text="Alerts")
         self.notebook.add(self.db_tab, text="Active Inference")
+        self.notebook.add(self.pe_config_tab, text="PE Config")
 
         self.build_connection_tab()
         self.build_containers_tab()
         self.build_gpus_tab()
         self.build_alerts_tab()
         self.build_db_tab()
+        self.build_pe_config_tab()
+
+    def configure_styles(self):
+        self.style = ttk.Style(self.root)
+        try:
+            if "clam" in self.style.theme_names():
+                self.style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        self.style.configure(
+            "PE.TNotebook",
+            background="#e5e7eb",
+            borderwidth=1,
+            tabmargins=(8, 8, 8, 0),
+        )
+        self.style.configure(
+            "PE.TNotebook.Tab",
+            background="#d1d5db",
+            foreground="#111827",
+            borderwidth=1,
+            font=("Segoe UI", 10, "bold"),
+            padding=(18, 10),
+        )
+        self.style.map(
+            "PE.TNotebook.Tab",
+            background=[
+                ("selected", "#2563eb"),
+                ("active", "#bfdbfe"),
+                ("!selected", "#d1d5db"),
+            ],
+            foreground=[
+                ("selected", "white"),
+                ("active", "#111827"),
+                ("!selected", "#111827"),
+            ],
+            expand=[("selected", (0, 0, 0, 2))],
+        )
 
     def build_clock_bar(self, parent, layout="pack"):
         clock_bar = ttk.Frame(parent)
@@ -1191,26 +1354,35 @@ class DockerMonitorApp:
         self.db_tab.columnconfigure(0, weight=1)
         self.db_tab.rowconfigure(3, weight=1)
 
-        ttk.Label(form, text="SSH").grid(row=0, column=0, sticky="w", pady=5)
-        ttk.Label(
-            form,
-            text=f"{DB_SSH_USERNAME}@{DB_SSH_HOST}:{DB_SSH_PORT}",
-        ).grid(row=0, column=1, sticky="w", pady=5)
-
-        ttk.Label(form, text="Database").grid(row=1, column=0, sticky="w", pady=5)
-        ttk.Label(form, text=DB_NAME).grid(row=1, column=1, sticky="w", pady=5)
-
-        ttk.Label(form, text="SSH Password").grid(row=2, column=0, sticky="w", pady=5)
-        self.db_password_entry = ttk.Entry(
-            form,
-            textvariable=self.db_password_var,
-            show="*",
+        ttk.Label(form, text="SSH Host").grid(row=0, column=0, sticky="w", pady=5)
+        ttk.Label(form, textvariable=self.selected_host_var).grid(
+            row=0,
+            column=1,
+            sticky="w",
+            pady=5,
         )
-        self.db_password_entry.grid(row=2, column=1, sticky="ew", pady=5)
-        self.db_password_entry.bind("<Return>", lambda _event: self.refresh_db_jobs())
+
+        ttk.Label(form, text="Username").grid(row=1, column=0, sticky="w", pady=5)
+        ttk.Label(form, textvariable=self.username_var).grid(
+            row=1,
+            column=1,
+            sticky="w",
+            pady=5,
+        )
+
+        ttk.Label(form, text="Password").grid(row=2, column=0, sticky="w", pady=5)
+        ttk.Label(form, text="Uses Connection tab password").grid(
+            row=2,
+            column=1,
+            sticky="w",
+            pady=5,
+        )
+
+        ttk.Label(form, text="Database").grid(row=3, column=0, sticky="w", pady=5)
+        ttk.Label(form, text=DB_NAME).grid(row=3, column=1, sticky="w", pady=5)
 
         buttons = ttk.Frame(form)
-        buttons.grid(row=3, column=1, sticky="w", pady=(12, 4))
+        buttons.grid(row=4, column=1, sticky="w", pady=(12, 4))
 
         self.db_refresh_button = ttk.Button(
             buttons,
@@ -1218,12 +1390,6 @@ class DockerMonitorApp:
             command=self.refresh_db_jobs,
         )
         self.db_refresh_button.grid(row=0, column=0, padx=(0, 8))
-
-        ttk.Button(
-            buttons,
-            text="Clear Password",
-            command=self.clear_db_password,
-        ).grid(row=0, column=1, padx=(0, 8))
 
         form.columnconfigure(1, weight=1)
 
@@ -1272,6 +1438,87 @@ class DockerMonitorApp:
         )
 
         self.db_jobs_tree.grid(row=0, column=0, sticky="nsew")
+        yscrollbar.grid(row=0, column=1, sticky="ns")
+        xscrollbar.grid(row=1, column=0, sticky="ew")
+        table_frame.columnconfigure(0, weight=1)
+        table_frame.rowconfigure(0, weight=1)
+
+    def build_pe_config_tab(self):
+        self.build_clock_bar(self.pe_config_tab, layout="grid")
+
+        form = ttk.Frame(self.pe_config_tab)
+        form.grid(row=1, column=0, sticky="ew")
+        self.pe_config_tab.columnconfigure(0, weight=1)
+        self.pe_config_tab.rowconfigure(3, weight=1)
+
+        ttk.Label(form, text="SSH Host").grid(row=0, column=0, sticky="w", pady=5)
+        ttk.Label(form, textvariable=self.selected_host_var).grid(
+            row=0,
+            column=1,
+            sticky="w",
+            pady=5,
+        )
+
+        ttk.Label(form, text="Compose File").grid(row=1, column=0, sticky="w", pady=5)
+        ttk.Label(form, text=PE_CONFIG_DOCKER_COMPOSE_LOC).grid(
+            row=1,
+            column=1,
+            sticky="w",
+            pady=5,
+        )
+
+        buttons = ttk.Frame(form)
+        buttons.grid(row=2, column=1, sticky="w", pady=(12, 4))
+
+        self.pe_config_refresh_button = ttk.Button(
+            buttons,
+            text="Refresh",
+            command=self.refresh_pe_config,
+        )
+        self.pe_config_refresh_button.grid(row=0, column=0, padx=(0, 8))
+
+        form.columnconfigure(1, weight=1)
+
+        self.pe_config_status_label = tk.Label(
+            self.pe_config_tab,
+            textvariable=self.pe_config_status_var,
+            anchor="w",
+            fg="black",
+        )
+        self.pe_config_status_label.grid(row=2, column=0, sticky="ew", pady=(10, 8))
+
+        table_frame = ttk.Frame(self.pe_config_tab)
+        table_frame.grid(row=3, column=0, sticky="nsew")
+
+        self.pe_config_tree = ttk.Treeview(
+            table_frame,
+            columns=("key", "service", "image"),
+            show="headings",
+        )
+        self.pe_config_tree.heading("key", text="Config Key")
+        self.pe_config_tree.heading("service", text="Service")
+        self.pe_config_tree.heading("image", text="Image")
+        self.pe_config_tree.column("key", width=190, minwidth=160, stretch=False)
+        self.pe_config_tree.column("service", width=160, minwidth=130, stretch=False)
+        self.pe_config_tree.column("image", width=720, minwidth=260, stretch=True)
+        self.pe_config_tree.tag_configure("missing", foreground="#b91c1c")
+
+        yscrollbar = ttk.Scrollbar(
+            table_frame,
+            orient="vertical",
+            command=self.pe_config_tree.yview,
+        )
+        xscrollbar = ttk.Scrollbar(
+            table_frame,
+            orient="horizontal",
+            command=self.pe_config_tree.xview,
+        )
+        self.pe_config_tree.configure(
+            yscrollcommand=yscrollbar.set,
+            xscrollcommand=xscrollbar.set,
+        )
+
+        self.pe_config_tree.grid(row=0, column=0, sticky="nsew")
         yscrollbar.grid(row=0, column=1, sticky="ns")
         xscrollbar.grid(row=1, column=0, sticky="ew")
         table_frame.columnconfigure(0, weight=1)
@@ -1545,74 +1792,55 @@ class DockerMonitorApp:
         if self.db_query_running:
             return
 
-        password = self.current_db_password()
-        if not password:
-            self.notebook.select(self.db_tab)
+        host = self.current_host()
+        username = self.username_var.get().strip()
+        password = self.current_password()
+
+        if not username:
+            self.notebook.select(self.connection_tab)
             self.set_db_status(
-                "Enter the reveal SSH password before refreshing jobs.",
+                "Enter a username on the Connection tab before refreshing jobs.",
                 "red",
             )
-            self.db_password_entry.focus_set()
+            self.set_connection_status("Enter a username before refreshing jobs.", "red")
+            self.username_entry.focus_set()
+            return
+
+        if not password:
+            self.notebook.select(self.connection_tab)
+            self.set_db_status(
+                "Enter the SSH password on the Connection tab before refreshing jobs.",
+                "red",
+            )
+            self.set_connection_status(
+                "Enter the SSH password before refreshing jobs.",
+                "red",
+            )
+            self.password_entry.focus_set()
             return
 
         self.db_query_running = True
         self.db_refresh_button.configure(state="disabled")
         self.set_db_status(
-            f"Querying {DB_NAME} on {DB_SSH_USERNAME}@{DB_SSH_HOST}...",
+            f"Querying {DB_NAME} on {username}@{host}...",
             "black",
         )
 
         thread = threading.Thread(
             target=self.db_jobs_worker,
-            args=(password,),
+            args=(host, username, password),
             daemon=True,
         )
         thread.start()
 
-    def current_db_password(self):
-        password = self.db_password_var.get()
-        if password:
-            return password
-
-        return os.getenv(DB_SSH_PASSWORD_ENV)
-
-    def db_jobs_worker(self, password):
+    def db_jobs_worker(self, host, username, password):
         try:
-            columns_command = dcs_jobs_columns_command()
-            columns_exit_code, columns_output, columns_error = run_remote_command(
-                columns_command,
-                host=DB_SSH_HOST,
-                port=DB_SSH_PORT,
-                username=DB_SSH_USERNAME,
-                password=password,
-            )
-
-            if columns_exit_code != 0:
-                result = {
-                    "ok": False,
-                    "exit_code": columns_exit_code,
-                    "command": columns_command,
-                    "output": columns_output,
-                    "error": columns_error,
-                }
-                self.root.after(0, lambda: self.finish_db_jobs_query(result))
-                return
-
-            column_rows = parse_db_jobs_output(columns_output)
-            columns = [row.get("column_name", "") for row in column_rows]
-            runner_job_column = dcs_runner_job_column(columns)
-            if not runner_job_column:
-                raise RuntimeError(
-                    "No runner-job id column was found in dcs.jobs. "
-                    f"Available columns: {', '.join(columns)}"
-                )
-
-            command = db_jobs_command(runner_job_column)
+            command = db_jobs_command()
             exit_code, output, error = run_remote_command(
                 command,
-                host=DB_SSH_HOST,
-                port=DB_SSH_PORT,
-                username=DB_SSH_USERNAME,
+                host=host,
+                port=PORT,
+                username=username,
                 password=password,
             )
             result = {
@@ -1626,15 +1854,15 @@ class DockerMonitorApp:
             if exit_code == 0:
                 rows = parse_db_jobs_output(output)
                 inference_command = inference_submitted_command(
-                    row.get("runner_job_id") for row in rows
+                    row.get("inference_job_id") for row in rows
                 )
 
                 if inference_command:
                     inference_exit_code, inference_output, inference_error = run_remote_command(
                         inference_command,
-                        host=DB_SSH_HOST,
-                        port=DB_SSH_PORT,
-                        username=DB_SSH_USERNAME,
+                        host=host,
+                        port=PORT,
+                        username=username,
                         password=password,
                     )
 
@@ -1651,7 +1879,7 @@ class DockerMonitorApp:
                         result["rows"] = merge_submitted_on(rows, inference_rows)
                         result["error"] = "\n".join(
                             text
-                            for text in (columns_error, error, inference_error)
+                            for text in (error, inference_error)
                             if text
                         )
                 else:
@@ -1674,7 +1902,7 @@ class DockerMonitorApp:
         if not result["ok"]:
             message = remote_command_failure_message(result)
             if "SSH authentication failed" in message:
-                self.clear_db_password(update_status=False)
+                self.clear_password(update_status=False)
 
             self.set_db_status(f"DB query failed: {message}", "red")
             return
@@ -1746,11 +1974,156 @@ class DockerMonitorApp:
         self.db_status_var.set(message)
         self.db_status_label.configure(fg=color)
 
-    def clear_db_password(self, update_status=True):
-        self.db_password_var.set("")
-        if update_status:
-            self.set_db_status("Reveal SSH password cleared.", "black")
-        self.db_password_entry.focus_set()
+    def refresh_pe_config(self):
+        if self.pe_config_running:
+            return
+
+        host = self.current_host()
+        username = self.username_var.get().strip()
+        password = self.current_password()
+
+        if not username:
+            self.set_pe_config_status(
+                "Enter a username on the Connection tab before refreshing PE Config.",
+                "red",
+            )
+            self.notebook.select(self.connection_tab)
+            self.set_connection_status(
+                "Enter a username before refreshing PE Config.",
+                "red",
+            )
+            self.username_entry.focus_set()
+            return
+
+        if not password:
+            self.set_pe_config_status(
+                "Enter the SSH password on the Connection tab before refreshing PE Config.",
+                "red",
+            )
+            self.notebook.select(self.connection_tab)
+            self.set_connection_status(
+                "Enter the SSH password before refreshing PE Config.",
+                "red",
+            )
+            self.password_entry.focus_set()
+            return
+
+        self.pe_config_running = True
+        self.pe_config_refresh_button.configure(state="disabled")
+        self.set_pe_config_status(
+            f"Loading {PE_CONFIG_DOCKER_COMPOSE_LOC} from {host}...",
+            "black",
+        )
+
+        thread = threading.Thread(
+            target=self.pe_config_worker,
+            args=(host, username, password),
+            daemon=True,
+        )
+        thread.start()
+
+    def pe_config_worker(self, host, username, password):
+        try:
+            command = pe_config_command()
+            exit_code, output, error = run_remote_command(
+                command,
+                host=host,
+                username=username,
+                password=password,
+            )
+            result = {
+                "ok": exit_code == 0,
+                "exit_code": exit_code,
+                "command": command,
+                "output": output,
+                "error": error,
+            }
+
+            if exit_code == 0:
+                result["rows"] = pe_config_rows(output)
+        except Exception as exc:
+            result = {
+                "ok": False,
+                "exception": str(exc),
+            }
+
+        try:
+            self.root.after(0, lambda: self.finish_pe_config_refresh(result))
+        except RuntimeError:
+            pass
+
+    def finish_pe_config_refresh(self, result):
+        self.pe_config_running = False
+        self.pe_config_refresh_button.configure(state="normal")
+
+        if not result["ok"]:
+            message = remote_command_failure_message(result)
+            if "SSH authentication failed" in message:
+                self.clear_password(update_status=False)
+
+            self.set_pe_config_status(f"PE Config refresh failed: {message}", "red")
+            return
+
+        rows = result["rows"]
+        self.render_pe_config(rows)
+
+        loaded_count = sum(1 for row in rows if row.get("image") and not row.get("missing"))
+        missing_count = sum(1 for row in rows if row.get("missing"))
+        loaded_message = (
+            f"Loaded {loaded_count} image values from {PE_CONFIG_DOCKER_COMPOSE_LOC}."
+        )
+        if missing_count:
+            loaded_message = (
+                f"{loaded_message} {missing_count} expected services were not found."
+            )
+
+        error = result.get("error", "").strip()
+        if error:
+            self.set_pe_config_status(
+                f"{loaded_message} Remote stderr: {error}",
+                "black",
+            )
+        else:
+            self.set_pe_config_status(loaded_message, "green")
+
+    def render_pe_config(self, rows):
+        for item in self.pe_config_tree.get_children():
+            self.pe_config_tree.delete(item)
+
+        image_values = []
+        for row in rows:
+            image = row.get("image", "")
+            if row.get("missing"):
+                image = "<missing service>"
+
+            image_values.append(image)
+            self.pe_config_tree.insert(
+                "",
+                "end",
+                values=(
+                    row.get("key", ""),
+                    row.get("service", ""),
+                    image,
+                ),
+                tags=("missing",) if row.get("missing") else (),
+            )
+
+        self.resize_pe_config_image_column(image_values)
+
+    def resize_pe_config_image_column(self, image_values):
+        values = ["Image", *image_values]
+        if tkfont is not None:
+            font = tkfont.nametofont("TkDefaultFont")
+            width = max(font.measure(value) for value in values) + 32
+        else:
+            width = max(len(value) for value in values) * 8 + 32
+
+        width = max(260, min(width, 1100))
+        self.pe_config_tree.column("image", width=width, minwidth=260)
+
+    def set_pe_config_status(self, message, color):
+        self.pe_config_status_var.set(message)
+        self.pe_config_status_label.configure(fg=color)
 
     def check_now(self):
         self.cancel_next_check()
